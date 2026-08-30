@@ -1,0 +1,18 @@
+image: rust:latest
+
+stages: [test]
+
+cache:
+  key: cargo
+  paths:
+    - target/
+    - .cargo/
+
+public-workspace:
+  stage: test
+  script:
+    - rustup component add clippy rustfmt
+    - ./scripts/check-boundary.sh
+    - cargo fmt --all --check
+    - cargo clippy --workspace --all-targets --locked -- -D warnings
+    - cargo test --workspace --locked -- --test-threads=4

@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/ai-fence-cli-core",
+    "crates/ai-fence-contract",
+    "crates/ai-fence-model-metadata",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Yilnic/ai-fence-cli"
