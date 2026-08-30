@@ -819,7 +819,7 @@ async fn proxy_websocket(
 async fn connect_local_proxy_upstream_websocket(
     request: tungstenite::handshake::client::Request,
     observe_request_duration: fn(f64),
-) -> Result<LocalProxyUpstreamWebSocket, tungstenite::Error> {
+) -> Result<LocalProxyUpstreamWebSocket, Box<tungstenite::Error>> {
     let connect_start = Instant::now();
     let mut last_error = None;
     for attempt in 1..=LOCAL_PROXY_WEBSOCKET_CONNECT_ATTEMPTS {
@@ -845,7 +845,7 @@ async fn connect_local_proxy_upstream_websocket(
             }
         }
     }
-    Err(last_error.expect("at least one connect attempt"))
+    Err(Box::new(last_error.expect("at least one connect attempt")))
 }
 
 async fn send_local_proxy_websocket_connect_error(
