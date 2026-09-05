@@ -17,6 +17,7 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
+      - run: python3 -m unittest discover -s tests -p 'test_release.py'
       - run: ./scripts/check-boundary.sh
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings

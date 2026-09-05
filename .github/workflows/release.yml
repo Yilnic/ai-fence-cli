@@ -1,0 +1,52 @@
+name: Publish verified CLI release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'Yilnic/ai-fence-cli'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a reviewed public-main snapshot
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: Test release immutability guards
+        run: python3 -m unittest discover -s tests -p 'test_release.py'
+      - name: Verify and publish frozen binaries, manifests, and SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/publish-release.py "releases/$GITHUB_REF_NAME.json"
+      - name: Correct the historical v0.1.0 download announcement
+        if: github.ref_name == 'v0.1.1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, runpy
+          from pathlib import Path
+          publisher = runpy.run_path("scripts/publish-release.py")
+          api = publisher["GitHub"](os.environ["GH_TOKEN"])
+          old = api.find_release("v0.1.0")
+          notes = Path("releases/corrections/v0.1.0.md").read_text()
+          if old is None or old["id"] != 379327799:
+              raise ValueError("historical release identity changed")
+          if old["body"] != notes:
+              if hashlib.sha256(old["body"].encode()).hexdigest() != "4f13bc610e2f674cd012cfe3b38c12b93d146d43cb25fa030eb5c7fca464357e":
+                  raise ValueError("historical release notes changed; review before correcting")
+              api.request("PATCH", "/releases/379327799", {"body": notes})
+          print("v0.1.0 announcement corrected; tag and assets unchanged")
+          PY

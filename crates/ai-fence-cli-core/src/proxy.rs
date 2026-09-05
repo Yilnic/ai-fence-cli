@@ -11,7 +11,7 @@ use actix_web::{
 use actix_ws::AggregatedMessage;
 use anyhow::{Context, Result};
 use bytes::BytesMut;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use std::future::{pending, Future};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -23,14 +23,113 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{info, warn};
 
 const LOCAL_PROXY_MAX_WEBSOCKET_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
-const LOCAL_PROXY_WEBSOCKET_CONNECT_ATTEMPTS: usize = 3;
-const LOCAL_PROXY_WEBSOCKET_CONNECT_BACKOFF: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const LOCAL_PROXY_WEBSOCKET_RETRY_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const LOCAL_PROXY_WEBSOCKET_RETRY_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(not(test))]
+const LOCAL_PROXY_WEBSOCKET_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const LOCAL_PROXY_WEBSOCKET_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
+const LOCAL_PROXY_WEBSOCKET_MAX_BACKOFF: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const LOCAL_PROXY_WEBSOCKET_MAX_BACKOFF: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
 const LOCAL_PROXY_UPSTREAM_IDLE_PING_INTERVAL: Duration = Duration::from_secs(25);
 #[cfg(test)]
 const LOCAL_PROXY_UPSTREAM_IDLE_PING_INTERVAL: Duration = Duration::from_millis(50);
 
 type LocalProxyUpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// The local WebSocket has already been upgraded by the time an upstream
+/// connection failure is reported. Keep enough structured information to send
+/// a useful, non-sensitive error event to the client instead of flattening
+/// every failure into a retry timeout.
+#[derive(Debug)]
+enum LocalProxyUpstreamWebSocketError {
+    /// An upstream HTTP handshake response which cannot be fixed by waiting
+    /// for a deployment to come back.
+    PermanentHandshake { upstream_status: u16 },
+    /// The fence rejected the OIDC access token and the local refresh token
+    /// could not produce a replacement. This needs user action, not a
+    /// two-minute network retry loop.
+    AuthenticationRefresh { error: anyhow::Error },
+    /// A connection failure that may be caused by an upstream deploy, network
+    /// interruption, or temporary capacity problem.
+    Unavailable {
+        error: anyhow::Error,
+        last_handshake_status: Option<u16>,
+    },
+}
+
+impl LocalProxyUpstreamWebSocketError {
+    fn from_tungstenite(error: tungstenite::Error) -> Self {
+        match error {
+            tungstenite::Error::Http(response)
+                if is_permanent_upstream_websocket_handshake_status(response.status().as_u16()) =>
+            {
+                Self::PermanentHandshake {
+                    upstream_status: response.status().as_u16(),
+                }
+            }
+            tungstenite::Error::Http(response) => Self::Unavailable {
+                last_handshake_status: Some(response.status().as_u16()),
+                error: anyhow::Error::new(tungstenite::Error::Http(response)),
+            },
+            error => Self::Unavailable {
+                error: anyhow::Error::new(error),
+                last_handshake_status: None,
+            },
+        }
+    }
+
+    fn with_retry_timeout(self) -> Self {
+        match self {
+            Self::Unavailable {
+                error,
+                last_handshake_status,
+            } => Self::Unavailable {
+                error: error.context(format!(
+                    "upstream WebSocket remained unavailable for {} seconds",
+                    LOCAL_PROXY_WEBSOCKET_RETRY_TIMEOUT.as_secs()
+                )),
+                last_handshake_status,
+            },
+            permanent => permanent,
+        }
+    }
+
+    fn preserve_handshake_status(self, fallback_status: Option<u16>) -> Self {
+        match self {
+            Self::Unavailable {
+                error,
+                last_handshake_status,
+            } => Self::Unavailable {
+                error,
+                last_handshake_status: last_handshake_status.or(fallback_status),
+            },
+            permanent => permanent,
+        }
+    }
+}
+
+impl std::fmt::Display for LocalProxyUpstreamWebSocketError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PermanentHandshake { upstream_status } => write!(
+                formatter,
+                "upstream WebSocket handshake was rejected with HTTP {upstream_status}"
+            ),
+            Self::AuthenticationRefresh { error } => {
+                write!(formatter, "OIDC credential refresh failed: {error:#}")
+            }
+            Self::Unavailable { error, .. } => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for LocalProxyUpstreamWebSocketError {}
 
 /// Configuration for the local proxy.
 #[derive(Debug, Clone)]
@@ -69,6 +168,12 @@ pub enum AuthMethod {
     MasterKey(String),
     /// OIDC JWT sent via X-Fence-Auth header.
     OidcToken(String),
+    /// OIDC JWT loaded from the shared credentials file for every request.
+    ///
+    /// Keeping the path rather than a token in proxy state lets another CLI
+    /// process refresh the shared login without requiring every running proxy
+    /// to be restarted.
+    OidcTokenFile(PathBuf),
     /// Session-scoped gateway key loaded from a file for each proxied request.
     GatewayKeyFile(PathBuf),
     /// Session-scoped gateway key supplied directly.
@@ -103,19 +208,21 @@ impl AuthMethod {
         } else if use_oidc {
             let creds = crate::auth::load_credentials()?
                 .context("No stored OIDC credentials. Run `ai-fence-cli auth login` first.")?;
-            if creds.is_expired() {
+            if creds.is_expired() && creds.refresh_token.is_none() {
                 anyhow::bail!(
-                    "Stored OIDC token is expired. Run `ai-fence-cli auth login` to refresh."
+                    "Stored OIDC token is expired and has no refresh token. Run `ai-fence-cli auth login` to refresh."
                 );
             }
-            Ok(AuthMethod::OidcToken(creds.access_token))
+            Ok(AuthMethod::OidcTokenFile(crate::auth::credentials_path()?))
         } else if let Some(key) = master_key {
             Ok(AuthMethod::MasterKey(key))
         } else if let Some(creds) = crate::auth::load_credentials()? {
-            if creds.is_expired() {
-                anyhow::bail!("Stored OIDC token is expired. Run `ai-fence-cli login` to refresh.");
+            if creds.is_expired() && creds.refresh_token.is_none() {
+                anyhow::bail!(
+                    "Stored OIDC token is expired and has no refresh token. Run `ai-fence-cli login` to refresh."
+                );
             }
-            Ok(AuthMethod::OidcToken(creds.access_token))
+            Ok(AuthMethod::OidcTokenFile(crate::auth::credentials_path()?))
         } else {
             anyhow::bail!(
                 "No proxy authentication configured. Run `ai-fence-cli login`, or pass --master-key for admin-only use."
@@ -128,6 +235,20 @@ impl AuthMethod {
         match self {
             AuthMethod::MasterKey(key) => Ok(vec![("x-fence-auth", format!("Bearer {key}"))]),
             AuthMethod::OidcToken(token) => Ok(vec![("x-fence-auth", format!("Bearer {token}"))]),
+            AuthMethod::OidcTokenFile(path) => {
+                let creds = crate::auth::load_credentials_from_path(path)?
+                    .with_context(|| format!("No stored OIDC credentials at {}", path.display()))?;
+                if creds.access_token.trim().is_empty() {
+                    anyhow::bail!(
+                        "Stored OIDC credentials at {} have an empty access token",
+                        path.display()
+                    );
+                }
+                Ok(vec![(
+                    "x-fence-auth",
+                    format!("Bearer {}", creds.access_token),
+                )])
+            }
             AuthMethod::GatewayKeyFile(path) => {
                 let key = std::fs::read_to_string(path).with_context(|| {
                     format!("failed to read gateway key file {}", path.display())
@@ -141,6 +262,25 @@ impl AuthMethod {
             AuthMethod::GatewayKey(key) => Ok(vec![("x-fence-auth", format!("Bearer {key}"))]),
             AuthMethod::ApiKey(key) => Ok(vec![("x-fence-auth", format!("Bearer {key}"))]),
         }
+    }
+
+    fn reloadable_oidc(&self) -> bool {
+        matches!(self, Self::OidcTokenFile(_))
+    }
+
+    async fn ensure_fresh_oidc(&self) -> Result<()> {
+        if let Self::OidcTokenFile(path) = self {
+            crate::auth::ensure_fresh_credentials_from_path(path).await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_rejected_oidc(&self, rejected_access_token: &str) -> Result<()> {
+        if let Self::OidcTokenFile(path) = self {
+            crate::auth::refresh_credentials_after_rejection_from_path(path, rejected_access_token)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -191,6 +331,7 @@ where
         auth = match &config.auth_method {
             AuthMethod::MasterKey(_) => "master-key",
             AuthMethod::OidcToken(_) => "OIDC JWT",
+            AuthMethod::OidcTokenFile(_) => "OIDC JWT (file)",
             AuthMethod::GatewayKeyFile(_) => "gateway-key-file",
             AuthMethod::GatewayKey(_) => "gateway-key",
             AuthMethod::ApiKey(_) => "api-key",
@@ -228,6 +369,8 @@ where
             .app_data(shared.clone())
             .default_service(web::to(proxy_handler))
     })
+    .workers(2)
+    .shutdown_timeout(1)
     .bind(&addr)
     .with_context(|| format!("Failed to bind to {addr}"))?
     .run();
@@ -290,11 +433,15 @@ async fn proxy_handler(
         return proxy_websocket(req, payload, state, fence_url).await;
     }
 
+    if let Err(error) = state.auth_method.ensure_fresh_oidc().await {
+        warn!(error = %format!("{error:#}"), "Failed to refresh OIDC credentials before forwarding request");
+        return Ok(oidc_refresh_failed_http_response());
+    }
+
     let body = read_payload(payload).await?;
     let (upstream_body, synthesize_anthropic_json) =
         anthropic_backend_stream_body(&req, body.as_ref())?;
 
-    // Build the upstream request with auth headers injected
     let upstream_method: reqwest::Method = method_str.parse().unwrap_or(reqwest::Method::GET);
     let upstream_client = reqwest::Client::builder()
         .default_headers(reqwest::header::HeaderMap::from_iter([(
@@ -305,66 +452,74 @@ async fn proxy_handler(
         .map_err(|e| {
             actix_web::error::ErrorInternalServerError(format!("Failed to create HTTP client: {e}"))
         })?;
-    let mut upstream_req = upstream_client
-        .request(upstream_method, &fence_url)
-        .body(upstream_body);
-    let provider_auth_token = state.provider_auth_token();
-
-    // Copy relevant headers from the client request
-    for (name, value) in req.headers() {
-        let name_lower = name.as_str().to_lowercase();
-        // Skip hop-by-hop headers and headers we're replacing
-        if should_skip_client_header(&name_lower) || name_lower == "accept-encoding" {
-            continue;
-        }
-        if state
-            .local_api_key
-            .as_deref()
-            .is_some_and(|local_key| is_local_api_key_header(&name_lower, value, local_key))
-        {
-            continue;
-        }
-        if name_lower == "authorization" && provider_auth_token.is_some() {
-            continue;
-        }
-        if let Ok(val) = value.to_str() {
-            upstream_req = upstream_req.header(name.as_str(), val);
-        }
-    }
-    if let Some(token) = provider_auth_token {
-        tracing::debug!(path = %req.uri().path(), "Injecting provider Authorization header from proxy env");
-        upstream_req = upstream_req.header("authorization", format!("Bearer {token}"));
-    }
-
-    // Inject fence auth headers
-    let auth_headers = state.auth_method.headers().map_err(|e| {
-        warn!(error = %e, "Failed to resolve proxy authentication headers");
-        actix_web::error::ErrorInternalServerError(format!(
-            "Failed to resolve proxy authentication headers: {e}"
-        ))
-    })?;
-    for (name, value) in auth_headers {
-        upstream_req = upstream_req.header(name, value);
-    }
-    for (name, value) in &state.correlation_headers {
-        upstream_req = upstream_req.header(name.as_str(), value.as_str());
-    }
-    upstream_req = upstream_req
-        .header("accept-encoding", "identity")
-        .header("x-fence-local-proxy", "true")
-        .header("x-fence-stream-keepalive", "true");
-
-    // Inject protocol diffs directory header when configured
-    if let Some(ref dir) = state.protocol_diffs_dir {
-        upstream_req =
-            upstream_req.header("x-fence-protocol-diffs-dir", dir.to_string_lossy().as_ref());
-    }
-
-    // Send the request
-    let upstream_resp = upstream_req.send().await.map_err(|e| {
+    let (upstream_request, sent_oidc_access_token) = build_upstream_http_request(
+        &upstream_client,
+        &upstream_method,
+        &fence_url,
+        &req,
+        &state,
+        &upstream_body,
+    )?;
+    let mut upstream_resp = upstream_request.send().await.map_err(|e| {
         warn!(error = %e, "Failed to forward request to fence");
         actix_web::error::ErrorInternalServerError(format!("Upstream request failed: {e}"))
     })?;
+
+    // A refreshed OIDC token is written by another CLI process. If the
+    // current request is rejected by the fence specifically for its auth
+    // header, consume that response and retry exactly once with headers read
+    // from the shared credentials file. Provider 401 responses are returned
+    // unchanged, so an invalid provider credential cannot duplicate a request.
+    if upstream_resp.status() == reqwest::StatusCode::UNAUTHORIZED
+        && state.auth_method.reloadable_oidc()
+    {
+        let response_status = upstream_resp.status();
+        let response_headers = upstream_resp.headers().clone();
+        let response_body = upstream_resp
+            .bytes()
+            .await
+            .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+        if is_fence_auth_rejection(&response_body) {
+            let Some(rejected_access_token) = sent_oidc_access_token.as_deref() else {
+                return Ok(copy_buffered_upstream_response(
+                    response_status,
+                    &response_headers,
+                    response_body,
+                ));
+            };
+            tracing::info!(
+                path = %req.uri().path(),
+                "Fence rejected X-Fence-Auth; refreshing or reloading OIDC credentials and retrying once"
+            );
+            if let Err(error) = state
+                .auth_method
+                .refresh_rejected_oidc(rejected_access_token)
+                .await
+            {
+                warn!(error = %format!("{error:#}"), "Failed to refresh rejected OIDC credentials");
+                return Ok(oidc_refresh_failed_http_response());
+            }
+            let (retry_request, _) = build_upstream_http_request(
+                &upstream_client,
+                &upstream_method,
+                &fence_url,
+                &req,
+                &state,
+                &upstream_body,
+            )?;
+            upstream_resp = retry_request.send().await.map_err(|e| {
+                warn!(error = %e, "Failed to retry request after reloading OIDC credentials");
+                actix_web::error::ErrorInternalServerError(format!("Upstream request failed: {e}"))
+            })?;
+        } else {
+            (state.observe_request_duration)(request_start.elapsed().as_secs_f64() * 1000.0);
+            return Ok(copy_buffered_upstream_response(
+                response_status,
+                &response_headers,
+                response_body,
+            ));
+        }
+    }
 
     let status_u16 = upstream_resp.status().as_u16();
     let status = ActixStatus::from_u16(status_u16).unwrap_or(ActixStatus::INTERNAL_SERVER_ERROR);
@@ -402,13 +557,33 @@ async fn proxy_handler(
             .bytes()
             .await
             .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
-        let body = synthesize_anthropic_message_json(&stream_body)?;
+        let (body, had_stream_error) = synthesize_anthropic_message_json(&stream_body)?;
+        if had_stream_error {
+            warn_reassembled_stream_error(&req, &body);
+        }
         builder.insert_header(("content-type", "application/json"));
         Ok(builder.body(body))
     } else if content_type.contains("text/event-stream") || content_type.contains("text/plain") {
-        // SSE streaming — forward as a streamed response body
-        let stream = upstream_resp.bytes_stream().map(|result| {
-            result.map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))
+        // SSE streaming — forward as a streamed response body. The forwarded
+        // bytes are never modified; a scanner shadows the chunks for terminal
+        // error events so a failure riding inside a committed 200 response is
+        // visible in the local CLI log (the client cannot back off from it,
+        // and nothing else logs it on this leg).
+        let path = req.uri().path().to_string();
+        let mut scanner = SseErrorEventScanner::default();
+        let mut warned = false;
+        let stream = upstream_resp.bytes_stream().map(move |result| {
+            result
+                .inspect(|chunk| {
+                    if !warned && scanner.scan(chunk) {
+                        warned = true;
+                        warn!(
+                            path = %path,
+                            "Upstream SSE stream carried a terminal error event inside a committed 200 response; client cannot back off"
+                        );
+                    }
+                })
+                .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))
         });
         Ok(builder.streaming(stream))
     } else {
@@ -419,6 +594,111 @@ async fn proxy_handler(
             .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
         Ok(builder.body(resp_body))
     }
+}
+
+fn build_upstream_http_request(
+    upstream_client: &reqwest::Client,
+    upstream_method: &reqwest::Method,
+    fence_url: &str,
+    req: &HttpRequest,
+    state: &ProxyState,
+    body: &[u8],
+) -> Result<(reqwest::RequestBuilder, Option<String>), actix_web::Error> {
+    let mut upstream_req = upstream_client
+        .request(upstream_method.clone(), fence_url)
+        .body(body.to_vec());
+    let provider_auth_token = state.provider_auth_token();
+
+    // Copy relevant headers from the client request.
+    for (name, value) in req.headers() {
+        let name_lower = name.as_str().to_lowercase();
+        if should_skip_client_header(&name_lower) || name_lower == "accept-encoding" {
+            continue;
+        }
+        if state
+            .local_api_key
+            .as_deref()
+            .is_some_and(|local_key| is_local_api_key_header(&name_lower, value, local_key))
+        {
+            continue;
+        }
+        if name_lower == "authorization" && provider_auth_token.is_some() {
+            continue;
+        }
+        if let Ok(val) = value.to_str() {
+            upstream_req = upstream_req.header(name.as_str(), val);
+        }
+    }
+    if let Some(token) = provider_auth_token {
+        tracing::debug!(path = %req.uri().path(), "Injecting provider Authorization header from proxy env");
+        upstream_req = upstream_req.header("authorization", format!("Bearer {token}"));
+    }
+
+    let auth_headers = state.auth_method.headers().map_err(|e| {
+        warn!(error = %e, "Failed to resolve proxy authentication headers");
+        actix_web::error::ErrorInternalServerError(format!(
+            "Failed to resolve proxy authentication headers: {e}"
+        ))
+    })?;
+    let mut oidc_access_token = None;
+    for (name, value) in auth_headers {
+        if name == "x-fence-auth" && state.auth_method.reloadable_oidc() {
+            oidc_access_token = value.strip_prefix("Bearer ").map(ToOwned::to_owned);
+        }
+        upstream_req = upstream_req.header(name, value);
+    }
+    for (name, value) in &state.correlation_headers {
+        upstream_req = upstream_req.header(name.as_str(), value.as_str());
+    }
+    upstream_req = upstream_req
+        .header("accept-encoding", "identity")
+        .header("x-fence-local-proxy", "true")
+        .header("x-fence-stream-keepalive", "true");
+
+    if let Some(ref dir) = state.protocol_diffs_dir {
+        upstream_req =
+            upstream_req.header("x-fence-protocol-diffs-dir", dir.to_string_lossy().as_ref());
+    }
+
+    Ok((upstream_req, oidc_access_token))
+}
+
+fn copy_buffered_upstream_response(
+    response_status: reqwest::StatusCode,
+    response_headers: &reqwest::header::HeaderMap,
+    response_body: bytes::Bytes,
+) -> HttpResponse {
+    let status = ActixStatus::from_u16(response_status.as_u16())
+        .unwrap_or(ActixStatus::INTERNAL_SERVER_ERROR);
+    let mut builder = HttpResponse::build(status);
+    for (name, value) in response_headers {
+        let name_lower = name.as_str().to_lowercase();
+        if matches!(
+            name_lower.as_str(),
+            "transfer-encoding" | "connection" | "keep-alive"
+        ) {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            builder.insert_header((name.as_str(), value));
+        }
+    }
+    builder.body(response_body)
+}
+
+fn oidc_refresh_failed_http_response() -> HttpResponse {
+    HttpResponse::Unauthorized().json(serde_json::json!({
+        "error": {
+            "type": "authentication_error",
+            "code": "oidc_refresh_failed",
+            "message": "The stored AI Fence login could not be refreshed automatically. Run `ai-fence-cli login` once, then retry."
+        }
+    }))
+}
+
+fn is_fence_auth_rejection(body: &[u8]) -> bool {
+    let body = String::from_utf8_lossy(body).to_ascii_lowercase();
+    body.contains("x-fence-auth") || body.contains("fence auth")
 }
 
 async fn read_payload(mut payload: web::Payload) -> Result<web::Bytes, actix_web::Error> {
@@ -461,7 +741,71 @@ fn is_anthropic_messages_path(path: &str) -> bool {
     )
 }
 
-fn synthesize_anthropic_message_json(stream_body: &[u8]) -> Result<Vec<u8>, actix_web::Error> {
+/// Log a reassembled in-stream upstream error. The body is an error envelope
+/// (already sanitized by the backend) returned with a committed 200 status —
+/// the client sees "not a Message" instead of a retryable status, so this
+/// warn is the only local trace of the conversion.
+fn warn_reassembled_stream_error(req: &HttpRequest, body: &[u8]) {
+    let value: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    let error = value.get("error");
+    warn!(
+        path = %req.uri().path(),
+        status = error
+            .and_then(|e| e.get("status"))
+            .and_then(|s| s.as_u64())
+            .unwrap_or(0),
+        error_type = error
+            .and_then(|e| e.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("unknown"),
+        message = error
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or(""),
+        "Reassembled upstream stream error into a 200 non-Message body; client cannot back off"
+    );
+}
+
+/// Terminal upstream SSE error frame prefix as emitted by the fence
+/// (`event: error\ndata: {"type":"error"...`). Matched as one marker so prose
+/// that merely discusses SSE errors cannot trip the scanner.
+const SSE_ERROR_FRAME_MARKER: &[u8] = b"event: error\ndata: {\"type\":\"error\"";
+
+/// Scans forwarded SSE chunks for terminal error frames across chunk
+/// boundaries without modifying the forwarded bytes. A carry buffer closes
+/// gaps when the marker splits across chunks.
+#[derive(Default)]
+struct SseErrorEventScanner {
+    carry: Vec<u8>,
+}
+
+impl SseErrorEventScanner {
+    fn scan(&mut self, chunk: &[u8]) -> bool {
+        let mut buf = Vec::with_capacity(self.carry.len() + chunk.len());
+        buf.extend_from_slice(&self.carry);
+        buf.extend_from_slice(chunk);
+        let found = buf
+            .windows(SSE_ERROR_FRAME_MARKER.len())
+            .any(|w| w == SSE_ERROR_FRAME_MARKER);
+        // Retain only a tail long enough to close a marker split across the
+        // next chunk boundary.
+        let keep = SSE_ERROR_FRAME_MARKER
+            .len()
+            .saturating_sub(1)
+            .min(buf.len());
+        self.carry = buf[buf.len() - keep..].to_vec();
+        found
+    }
+}
+
+/// Reassemble a forced-streaming Anthropic response back into a single
+/// non-streaming Message JSON. Returns the body plus whether the stream
+/// carried a terminal `error` event instead of a message: that body is an
+/// error envelope riding inside an already-committed 200 response — the
+/// least discoverable failure mode in the stack, which callers must log.
+fn synthesize_anthropic_message_json(
+    stream_body: &[u8],
+) -> Result<(Vec<u8>, bool), actix_web::Error> {
     let stream_text = String::from_utf8_lossy(stream_body);
     let mut message = serde_json::Map::new();
     let mut content = Vec::<serde_json::Value>::new();
@@ -541,7 +885,12 @@ fn synthesize_anthropic_message_json(stream_body: &[u8]) -> Result<Vec<u8>, acti
 
     if let Some(error) = stream_error {
         return serde_json::to_vec(&error)
+            .map(|body| (body, true))
             .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()));
+    }
+
+    for block in &mut content {
+        finalize_aggregated_tool_use(block);
     }
 
     message
@@ -565,6 +914,7 @@ fn synthesize_anthropic_message_json(stream_body: &[u8]) -> Result<Vec<u8>, acti
     message.insert("usage".to_string(), usage);
 
     serde_json::to_vec(&serde_json::Value::Object(message))
+        .map(|body| (body, false))
         .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))
 }
 
@@ -587,6 +937,37 @@ fn apply_anthropic_delta(block: &mut serde_json::Value, delta: Option<&serde_jso
         }
         _ => {}
     }
+}
+
+/// A non-streaming Anthropic message carries parsed tool arguments in
+/// `input`; the aggregated upstream stream only accumulates the raw
+/// `partial_json` fragments. Parse them once aggregation completes and
+/// drop the streaming-only field, so spec-conforming clients that read
+/// `input` (e.g. Junie's harness) see the arguments instead of an empty
+/// object.
+fn finalize_aggregated_tool_use(block: &mut serde_json::Value) {
+    if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+        return;
+    }
+    let Some(map) = block.as_object_mut() else {
+        return;
+    };
+    let partial = map.remove("partial_json");
+    let has_parsed_input = map
+        .get("input")
+        .and_then(|value| value.as_object())
+        .map(|input| !input.is_empty())
+        .unwrap_or(false);
+    if has_parsed_input {
+        return;
+    }
+    let input = partial
+        .as_ref()
+        .and_then(|value| value.as_str())
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    map.insert("input".to_string(), input);
 }
 
 fn append_string_field(
@@ -627,6 +1008,12 @@ async fn proxy_websocket(
     state: web::Data<ProxyState>,
     fence_url: String,
 ) -> Result<HttpResponse, actix_web::Error> {
+    state.auth_method.ensure_fresh_oidc().await.map_err(|error| {
+        warn!(error = %format!("{error:#}"), "Failed to refresh OIDC credentials before WebSocket connection");
+        actix_web::error::ErrorUnauthorized(
+            "Stored AI Fence login could not be refreshed automatically. Run `ai-fence-cli login` once, then retry.",
+        )
+    })?;
     let (mut response, mut client_session, client_stream) = actix_ws::handle(&req, payload)?;
     add_codex_websocket_headers(&mut response);
     let mut client_stream = client_stream
@@ -635,21 +1022,39 @@ async fn proxy_websocket(
         .max_continuation_size(LOCAL_PROXY_MAX_WEBSOCKET_MESSAGE_BYTES);
 
     let upstream_request = build_upstream_websocket_request(&req, &state, &fence_url)?;
+    let request_context = req.clone();
     actix_web::rt::spawn(async move {
-        let (mut upstream_sink, mut upstream_stream) = match connect_local_proxy_upstream_websocket(
-            upstream_request.clone(),
+        // Do not make the local WebSocket's lifetime depend on a single
+        // upstream connection attempt. In particular, Codex keeps this local
+        // connection around for subsequent turns. If the fence is temporarily
+        // unavailable, the failed turn must not make every later turn require
+        // a launcher/Codex restart.
+        //
+        // Codex sends its first request while the initial upstream handshake
+        // is in progress. If that bounded handshake fails, discard that one
+        // buffered request after reporting its terminal error; it is never
+        // replayed later when the fence returns.
+        let (mut upstream_sink, mut upstream_stream, mut discard_initial_failed_request): (
+            Option<futures::stream::SplitSink<LocalProxyUpstreamWebSocket, tungstenite::Message>>,
+            Option<futures::stream::SplitStream<LocalProxyUpstreamWebSocket>>,
+            bool,
+        ) = match connect_upstream_websocket_with_auth_reload(
+            upstream_request,
+            &request_context,
+            &state,
+            &fence_url,
             state.observe_request_duration,
         )
         .await
         {
             Ok(ws) => {
                 let (sink, stream) = ws.split();
-                (Some(sink), Some(stream))
+                (Some(sink), Some(stream), false)
             }
             Err(err) => {
-                warn!(error = %err, "Failed to connect upstream WebSocket");
-                send_local_proxy_websocket_connect_error(&mut client_session, &err).await;
-                return;
+                warn!(error = %err, "Failed to connect upstream WebSocket; failing initial request without replay");
+                send_local_proxy_websocket_error(&mut client_session, &err).await;
+                (None, None, true)
             }
         };
         let mut upstream_in_flight = false;
@@ -687,60 +1092,125 @@ async fn proxy_websocket(
                         }
                     };
 
+                    let is_request_payload = matches!(
+                        sent_message,
+                        tungstenite::Message::Text(_) | tungstenite::Message::Binary(_)
+                    );
+
+                    if discard_initial_failed_request && is_request_payload {
+                        discard_initial_failed_request = false;
+                        tracing::info!(
+                            "Discarding request buffered during failed initial upstream WebSocket handshake"
+                        );
+                        continue;
+                    }
+
+                    // Client ping/pong frames must not begin a 120-second
+                    // reconnect attempt while the upstream is down. They are
+                    // transport maintenance, not a request to replay.
+                    if upstream_sink.is_none() && !is_request_payload {
+                        continue;
+                    }
+
+                    // Give an already-buffered idle upstream close/error a
+                    // chance to win over this new request. The old upstream
+                    // has not seen this frame yet, so reconnecting here is
+                    // safe and preserves the normal idle-reconnect path.
+                    // Once `send` below is attempted, this proxy deliberately
+                    // never retries that frame because delivery is ambiguous.
+                    if is_request_payload && !upstream_in_flight {
+                        let queued_upstream_message = upstream_stream
+                            .as_mut()
+                            .and_then(|stream| stream.next().now_or_never());
+                        match queued_upstream_message {
+                            Some(None) => {
+                                tracing::debug!(
+                                    "Idle upstream WebSocket stream ended before forwarding client frame"
+                                );
+                                upstream_sink = None;
+                                upstream_stream = None;
+                            }
+                            Some(Some(Err(err))) => {
+                                if is_tungstenite_websocket_eof_error(&err) {
+                                    tracing::debug!(
+                                        error = %err,
+                                        "Idle upstream WebSocket disconnected before forwarding client frame"
+                                    );
+                                } else {
+                                    warn!(
+                                        error = %err,
+                                        "Idle upstream WebSocket read failed before forwarding client frame"
+                                    );
+                                }
+                                upstream_sink = None;
+                                upstream_stream = None;
+                            }
+                            Some(Some(Ok(tungstenite::Message::Close(reason)))) => {
+                                tracing::debug!(
+                                    ?reason,
+                                    "Idle upstream WebSocket closed before forwarding client frame"
+                                );
+                                upstream_sink = None;
+                                upstream_stream = None;
+                            }
+                            Some(Some(Ok(message))) => {
+                                if !forward_upstream_ws_message(message, &mut client_session).await {
+                                    break;
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+
                     if upstream_sink.is_none() {
                         tracing::info!("Reconnecting local proxy upstream WebSocket before forwarding client frame");
-                        match connect_local_proxy_upstream_websocket(
-                            upstream_request.clone(),
+                        match reconnect_upstream_websocket_with_auth_reload(
+                            &request_context,
+                            &state,
+                            &fence_url,
                             state.observe_request_duration,
                         )
-                        .await
-                        {
+                        .await {
                             Ok(ws) => {
                                 let (sink, stream) = ws.split();
                                 upstream_sink = Some(sink);
                                 upstream_stream = Some(stream);
                             }
                             Err(err) => {
-                                warn!(error = %err, "Failed to reconnect upstream WebSocket");
-                                send_local_proxy_websocket_connect_error(&mut client_session, &err).await;
-                                break;
+                                warn!(error = %err, "Failed to reconnect upstream WebSocket; failing affected request without replay");
+                                send_local_proxy_websocket_error(&mut client_session, &err).await;
+                                // Keep the local WebSocket open. A later
+                                // request gets a fresh bounded reconnect
+                                // attempt and can succeed after the outage.
+                                continue;
                             }
                         }
                     }
 
-                    let is_request_payload = matches!(
-                        sent_message,
-                        tungstenite::Message::Text(_) | tungstenite::Message::Binary(_)
-                    );
                     let send_result = upstream_sink
                         .as_mut()
                         .expect("checked upstream connection")
-                        .send(sent_message.clone())
+                        .send(sent_message)
                         .await;
                     if let Err(err) = send_result {
-                        warn!(error = %err, "Local proxy upstream WebSocket send failed; reconnecting once");
-                        match connect_local_proxy_upstream_websocket(
-                            upstream_request.clone(),
-                            state.observe_request_duration,
-                        )
-                        .await
-                        {
-                            Ok(ws) => {
-                                let (mut sink, stream) = ws.split();
-                                if let Err(err) = sink.send(sent_message).await {
-                                    warn!(error = %err, "Local proxy upstream WebSocket resend failed after reconnect");
-                                    let _ = client_session.close(None).await;
-                                    break;
-                                }
-                                upstream_sink = Some(sink);
-                                upstream_stream = Some(stream);
-                            }
-                            Err(err) => {
-                                warn!(error = %err, "Failed to reconnect upstream WebSocket after send failure");
-                                send_local_proxy_websocket_connect_error(&mut client_session, &err).await;
-                                break;
-                            }
+                        warn!(error = %err, "Local proxy upstream WebSocket send failed; failing affected request without replay");
+                        upstream_sink = None;
+                        upstream_stream = None;
+                        if is_request_payload {
+                            let error = LocalProxyUpstreamWebSocketError::Unavailable {
+                                error: anyhow::Error::new(err).context(
+                                    "upstream WebSocket send failed before the response completed",
+                                ),
+                                last_handshake_status: None,
+                            };
+                            send_local_proxy_websocket_error(&mut client_session, &error).await;
                         }
+                        // A following client request will establish a new
+                        // upstream connection. Do not resend this frame: the
+                        // original peer might have received it before the
+                        // send operation reported a transport failure.
+                        upstream_in_flight = false;
+                        continue;
                     }
                     if is_request_payload {
                         upstream_in_flight = true;
@@ -757,8 +1227,15 @@ async fn proxy_websocket(
                         upstream_sink = None;
                         upstream_stream = None;
                         if upstream_in_flight {
-                            let _ = client_session.close(None).await;
-                            break;
+                            warn!("Upstream WebSocket closed before the response completed; failing affected request without replay");
+                            send_local_proxy_websocket_error(
+                                &mut client_session,
+                                &upstream_websocket_interrupted_error(
+                                    "upstream WebSocket closed before the response completed",
+                                ),
+                            )
+                            .await;
+                            upstream_in_flight = false;
                         }
                         continue;
                     };
@@ -773,18 +1250,36 @@ async fn proxy_websocket(
                                 warn!(error = %err, in_flight = upstream_in_flight, "Upstream WebSocket read failed");
                             }
                             if upstream_in_flight {
-                                let _ = client_session.close(None).await;
-                                break;
+                                send_local_proxy_websocket_error(
+                                    &mut client_session,
+                                    &upstream_websocket_interrupted_error(format!(
+                                        "upstream WebSocket read failed before the response completed: {err}"
+                                    )),
+                                )
+                                .await;
+                                upstream_in_flight = false;
                             }
                             continue;
                         }
                     };
                     let upstream_finished = local_proxy_upstream_message_finishes(&upstream_msg);
                     match upstream_msg {
-                        tungstenite::Message::Close(reason) if !upstream_in_flight => {
-                            tracing::debug!(?reason, "Idle upstream WebSocket closed; keeping local WebSocket open");
+                        tungstenite::Message::Close(reason) => {
                             upstream_sink = None;
                             upstream_stream = None;
+                            if upstream_in_flight {
+                                warn!(?reason, "Upstream WebSocket closed before the response completed; failing affected request without replay");
+                                send_local_proxy_websocket_error(
+                                    &mut client_session,
+                                    &upstream_websocket_interrupted_error(
+                                        "upstream WebSocket closed before the response completed",
+                                    ),
+                                )
+                                .await;
+                                upstream_in_flight = false;
+                            } else {
+                                tracing::debug!(?reason, "Idle upstream WebSocket closed; keeping local WebSocket open");
+                            }
                             continue;
                         }
                         message => {
@@ -819,54 +1314,284 @@ async fn proxy_websocket(
 async fn connect_local_proxy_upstream_websocket(
     request: tungstenite::handshake::client::Request,
     observe_request_duration: fn(f64),
-) -> Result<LocalProxyUpstreamWebSocket, Box<tungstenite::Error>> {
+) -> std::result::Result<LocalProxyUpstreamWebSocket, LocalProxyUpstreamWebSocketError> {
     let connect_start = Instant::now();
+    let retry_deadline = connect_start + LOCAL_PROXY_WEBSOCKET_RETRY_TIMEOUT;
+    let mut attempt = 0_u32;
+    let mut backoff = LOCAL_PROXY_WEBSOCKET_INITIAL_BACKOFF;
     let mut last_error = None;
-    for attempt in 1..=LOCAL_PROXY_WEBSOCKET_CONNECT_ATTEMPTS {
-        match connect_async(request.clone()).await {
-            Ok((ws, _)) => {
+    let mut last_handshake_status = None;
+
+    loop {
+        attempt += 1;
+        let remaining = retry_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(LocalProxyUpstreamWebSocketError::Unavailable {
+                error: last_error.unwrap_or_else(|| {
+                    anyhow::anyhow!("upstream WebSocket connection retry deadline elapsed")
+                }),
+                last_handshake_status,
+            }
+            .with_retry_timeout());
+        }
+
+        match tokio::time::timeout(remaining, connect_async(request.clone())).await {
+            Ok(Ok((ws, _))) => {
                 observe_request_duration(connect_start.elapsed().as_secs_f64() * 1000.0);
                 if attempt > 1 {
-                    tracing::info!(attempt, "Local proxy upstream WebSocket reconnected");
+                    tracing::info!(
+                        attempt,
+                        unavailable_ms = connect_start.elapsed().as_millis(),
+                        "Local proxy upstream WebSocket reconnected"
+                    );
                 }
                 return Ok(ws);
             }
-            Err(err) => {
-                warn!(
-                    attempt,
-                    max_attempts = LOCAL_PROXY_WEBSOCKET_CONNECT_ATTEMPTS,
-                    error = %err,
-                    "Local proxy upstream WebSocket connect attempt failed"
-                );
-                last_error = Some(err);
-                if attempt < LOCAL_PROXY_WEBSOCKET_CONNECT_ATTEMPTS {
-                    sleep(LOCAL_PROXY_WEBSOCKET_CONNECT_BACKOFF * attempt as u32).await;
+            Ok(Err(err)) => {
+                let error = LocalProxyUpstreamWebSocketError::from_tungstenite(err);
+                if matches!(
+                    &error,
+                    LocalProxyUpstreamWebSocketError::PermanentHandshake { .. }
+                ) {
+                    return Err(error);
                 }
+                let remaining = retry_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error
+                        .preserve_handshake_status(last_handshake_status)
+                        .with_retry_timeout());
+                }
+                let retry_after = std::cmp::min(backoff, remaining);
+                if attempt == 1 {
+                    warn!(
+                        attempt,
+                        retry_after_ms = retry_after.as_millis(),
+                        retry_timeout_secs = LOCAL_PROXY_WEBSOCKET_RETRY_TIMEOUT.as_secs(),
+                        error = %error,
+                        "Local proxy upstream WebSocket unavailable; retrying"
+                    );
+                } else {
+                    tracing::debug!(
+                        attempt,
+                        retry_after_ms = retry_after.as_millis(),
+                        error = %error,
+                        "Local proxy upstream WebSocket still unavailable"
+                    );
+                }
+                let LocalProxyUpstreamWebSocketError::Unavailable {
+                    error,
+                    last_handshake_status: handshake_status,
+                } = error
+                else {
+                    unreachable!("permanent handshake errors return before retrying");
+                };
+                if handshake_status.is_some() {
+                    last_handshake_status = handshake_status;
+                }
+                last_error = Some(error);
+                sleep(retry_after).await;
+                backoff =
+                    std::cmp::min(backoff.saturating_mul(2), LOCAL_PROXY_WEBSOCKET_MAX_BACKOFF);
+            }
+            Err(_) => {
+                return Err(LocalProxyUpstreamWebSocketError::Unavailable {
+                    error: anyhow::anyhow!(
+                        "upstream WebSocket connection timed out after {} seconds",
+                        LOCAL_PROXY_WEBSOCKET_RETRY_TIMEOUT.as_secs()
+                    ),
+                    last_handshake_status,
+                });
             }
         }
     }
-    Err(Box::new(last_error.expect("at least one connect attempt")))
 }
 
-async fn send_local_proxy_websocket_connect_error(
+async fn connect_upstream_websocket_with_auth_reload(
+    request: tungstenite::handshake::client::Request,
+    request_context: &HttpRequest,
+    state: &ProxyState,
+    fence_url: &str,
+    observe_request_duration: fn(f64),
+) -> std::result::Result<LocalProxyUpstreamWebSocket, LocalProxyUpstreamWebSocketError> {
+    let sent_oidc_access_token = websocket_oidc_access_token(&request);
+    match connect_local_proxy_upstream_websocket(request, observe_request_duration).await {
+        Err(LocalProxyUpstreamWebSocketError::PermanentHandshake {
+            upstream_status: 401,
+        }) if state.auth_method.reloadable_oidc() => {
+            tracing::info!(
+                "Fence rejected WebSocket X-Fence-Auth; refreshing or reloading OIDC credentials and retrying once"
+            );
+            let Some(rejected_access_token) = sent_oidc_access_token.as_deref() else {
+                return Err(LocalProxyUpstreamWebSocketError::PermanentHandshake {
+                    upstream_status: 401,
+                });
+            };
+            state
+                .auth_method
+                .refresh_rejected_oidc(rejected_access_token)
+                .await
+                .map_err(
+                    |error| LocalProxyUpstreamWebSocketError::AuthenticationRefresh { error },
+                )?;
+            let refreshed_request =
+                build_upstream_websocket_request(request_context, state, fence_url)
+                    .map_err(websocket_request_build_error)?;
+            connect_local_proxy_upstream_websocket(refreshed_request, observe_request_duration)
+                .await
+        }
+        result => result,
+    }
+}
+
+async fn reconnect_upstream_websocket_with_auth_reload(
+    request_context: &HttpRequest,
+    state: &ProxyState,
+    fence_url: &str,
+    observe_request_duration: fn(f64),
+) -> std::result::Result<LocalProxyUpstreamWebSocket, LocalProxyUpstreamWebSocketError> {
+    state
+        .auth_method
+        .ensure_fresh_oidc()
+        .await
+        .map_err(|error| LocalProxyUpstreamWebSocketError::AuthenticationRefresh { error })?;
+    let request = build_upstream_websocket_request(request_context, state, fence_url)
+        .map_err(websocket_request_build_error)?;
+    connect_upstream_websocket_with_auth_reload(
+        request,
+        request_context,
+        state,
+        fence_url,
+        observe_request_duration,
+    )
+    .await
+}
+
+fn websocket_oidc_access_token(
+    request: &tungstenite::handshake::client::Request,
+) -> Option<String> {
+    request
+        .headers()
+        .get("x-fence-auth")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(ToOwned::to_owned)
+}
+
+fn websocket_request_build_error(error: actix_web::Error) -> LocalProxyUpstreamWebSocketError {
+    LocalProxyUpstreamWebSocketError::Unavailable {
+        error: anyhow::anyhow!(error.to_string()),
+        last_handshake_status: None,
+    }
+}
+
+/// Report a failed client turn while deliberately preserving the local
+/// WebSocket. A Codex process can use the same socket for later turns after a
+/// temporary fence outage; closing it would make a one-turn failure terminal
+/// for that process.
+async fn send_local_proxy_websocket_error(
     client_session: &mut actix_ws::Session,
-    err: &tungstenite::Error,
+    err: &LocalProxyUpstreamWebSocketError,
 ) {
     let _ = client_session
-        .text(
+        .text(websocket_connect_error_payload(err).to_string())
+        .await;
+}
+
+fn upstream_websocket_interrupted_error(
+    message: impl std::fmt::Display,
+) -> LocalProxyUpstreamWebSocketError {
+    LocalProxyUpstreamWebSocketError::Unavailable {
+        error: anyhow::anyhow!("{message}"),
+        last_handshake_status: None,
+    }
+}
+
+fn is_permanent_upstream_websocket_handshake_status(status: u16) -> bool {
+    // 408 and 429 can recover without a client configuration change. Do not
+    // treat opaque proxy/gateway statuses (for example Cloudflare's 520) as
+    // permanent: the original backend 401 may no longer be visible there.
+    matches!(
+        status,
+        400 | 401 | 403 | 404 | 405 | 406 | 407 | 410 | 411 | 413 | 414 | 415 | 422
+    )
+}
+
+fn websocket_connect_error_payload(error: &LocalProxyUpstreamWebSocketError) -> serde_json::Value {
+    match error {
+        LocalProxyUpstreamWebSocketError::AuthenticationRefresh { .. } => serde_json::json!({
+            "type": "error",
+            "status": 401,
+            "error": {
+                "type": "authentication_error",
+                "message": "The stored AI Fence login could not be refreshed automatically. Run `ai-fence-cli login` once, then retry.",
+                "code": "oidc_refresh_failed"
+            }
+        }),
+        LocalProxyUpstreamWebSocketError::PermanentHandshake {
+            upstream_status: 401,
+        } => serde_json::json!({
+            "type": "error",
+            "status": 401,
+            "error": {
+                "type": "authentication_error",
+                "message": "Upstream WebSocket authentication was rejected. Restart Codex with a valid provider login or configured API key.",
+                "code": "upstream_authentication_failed"
+            }
+        }),
+        LocalProxyUpstreamWebSocketError::PermanentHandshake {
+            upstream_status: 403,
+        } => serde_json::json!({
+            "type": "error",
+            "status": 403,
+            "error": {
+                "type": "permission_error",
+                "message": "Upstream WebSocket authorization was denied. Check the account and project permissions used by this session.",
+                "code": "upstream_authorization_failed"
+            }
+        }),
+        LocalProxyUpstreamWebSocketError::PermanentHandshake { upstream_status } => {
             serde_json::json!({
+                "type": "error",
+                "status": upstream_status,
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": format!("Upstream WebSocket handshake was rejected with HTTP {upstream_status}. Check the local proxy and client configuration."),
+                    "code": "upstream_handshake_rejected"
+                }
+            })
+        }
+        LocalProxyUpstreamWebSocketError::Unavailable {
+            error,
+            last_handshake_status: Some(520),
+        } => serde_json::json!({
+            "type": "error",
+            "status": 502,
+            "error": {
+                "type": "server_error",
+                "message": format!("Upstream WebSocket connection failed: {error}. The upstream gateway returned HTTP 520, which can mask rejected provider authentication. Verify provider credentials are being forwarded, then retry."),
+                "code": "upstream_gateway_error",
+                "upstream_status": 520
+            }
+        }),
+        LocalProxyUpstreamWebSocketError::Unavailable {
+            error,
+            last_handshake_status,
+        } => {
+            let mut payload = serde_json::json!({
                 "type": "error",
                 "status": 502,
                 "error": {
                     "type": "server_error",
-                    "message": format!("Upstream WebSocket connection failed: {err}"),
+                    "message": format!("Upstream WebSocket connection failed: {error}"),
                     "code": "server_error"
                 }
-            })
-            .to_string(),
-        )
-        .await;
-    let _ = client_session.clone().close(None).await;
+            });
+            if let Some(upstream_status) = last_handshake_status {
+                payload["error"]["upstream_status"] = serde_json::json!(upstream_status);
+            }
+            payload
+        }
+    }
 }
 
 enum ClientWebSocketMessage {
@@ -1247,14 +1972,536 @@ pub fn correlation_headers(
 mod tests {
     use super::*;
     use actix_web::web;
+    use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
     static NEXT_PROXY_TEST_PORT: AtomicU16 = AtomicU16::new(32000);
+    static AUTH_FILE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestCredentialsScope {
+        _lock: MutexGuard<'static, ()>,
+        previous_channel: Option<OsString>,
+        directory: std::path::PathBuf,
+    }
+
+    impl TestCredentialsScope {
+        fn new() -> Self {
+            let lock = AUTH_FILE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous_channel = std::env::var_os("AI_FENCE_CLI_CHANNEL");
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("test clock should be after unix epoch")
+                .as_nanos();
+            let channel = format!("proxy-auth-test-{}-{nonce}", std::process::id());
+            let directory = crate::config::config_dir_for_channel(Some(&channel))
+                .expect("create isolated test config directory");
+            std::env::set_var("AI_FENCE_CLI_CHANNEL", &channel);
+            Self {
+                _lock: lock,
+                previous_channel,
+                directory,
+            }
+        }
+
+        fn write_credentials(&self, access_token: &str) {
+            write_test_credentials(access_token);
+        }
+
+        fn write_credentials_for_issuer(
+            &self,
+            access_token: &str,
+            refresh_token: &str,
+            issuer: &str,
+            expires_at: i64,
+        ) {
+            crate::auth::save_credentials(&crate::auth::StoredCredentials {
+                access_token: access_token.to_string(),
+                refresh_token: Some(refresh_token.to_string()),
+                expires_at: Some(expires_at),
+                issuer: issuer.to_string(),
+                client_id: "ai-fence-cli-test".to_string(),
+            })
+            .expect("write test credentials");
+        }
+    }
+
+    impl Drop for TestCredentialsScope {
+        fn drop(&mut self) {
+            match self.previous_channel.take() {
+                Some(value) => std::env::set_var("AI_FENCE_CLI_CHANNEL", value),
+                None => std::env::remove_var("AI_FENCE_CLI_CHANNEL"),
+            }
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn write_test_credentials(access_token: &str) {
+        crate::auth::save_credentials(&crate::auth::StoredCredentials {
+            access_token: access_token.to_string(),
+            refresh_token: Some("refresh-test-token".to_string()),
+            expires_at: Some(chrono::Utc::now().timestamp() + 3600),
+            issuer: "https://id.example.test/".to_string(),
+            client_id: "ai-fence-cli-test".to_string(),
+        })
+        .expect("write test credentials");
+    }
+
+    fn forwarded_fence_auth(request: &str) -> String {
+        request
+            .lines()
+            .find_map(|line| line.strip_prefix("x-fence-auth: "))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn oidc_proxy_headers_follow_shared_credential_file_updates() {
+        let scope = TestCredentialsScope::new();
+        scope.write_credentials("old-access-token");
+        let auth = AuthMethod::resolve(None, true, None, None, None)
+            .expect("initial OIDC credentials should resolve");
+        assert_eq!(
+            auth.headers().expect("initial auth headers"),
+            vec![("x-fence-auth", "Bearer old-access-token".to_string())]
+        );
+
+        scope.write_credentials("new-access-token");
+
+        assert_eq!(
+            auth.headers()
+                .expect("auth headers should reload the shared credentials file"),
+            vec![("x-fence-auth", "Bearer new-access-token".to_string())]
+        );
+    }
+
+    #[test]
+    fn expired_oidc_with_refresh_token_can_start_the_proxy() {
+        let scope = TestCredentialsScope::new();
+        scope.write_credentials_for_issuer(
+            "expired-access-token",
+            "usable-refresh-token",
+            "https://id.example.test/",
+            chrono::Utc::now().timestamp() - 60,
+        );
+
+        let auth = AuthMethod::resolve(None, true, None, None, None)
+            .expect("runtime refresh should be allowed to recover the proxy");
+
+        assert!(matches!(auth, AuthMethod::OidcTokenFile(_)));
+    }
+
+    #[test]
+    fn saved_oidc_credentials_are_private() {
+        let scope = TestCredentialsScope::new();
+        scope.write_credentials("private-access-token");
+        let path = crate::auth::credentials_path().expect("credentials path");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)
+                .expect("credentials metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "OIDC credentials must not be world-readable");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_oidc_credentials_replaces_the_file_atomically() {
+        let scope = TestCredentialsScope::new();
+        scope.write_credentials("old-access-token");
+        let path = crate::auth::credentials_path().expect("credentials path");
+        let mut old_file = std::fs::File::open(&path).expect("open old credentials file");
+
+        scope.write_credentials("new-access-token");
+
+        let mut old_snapshot = String::new();
+        old_file
+            .read_to_string(&mut old_snapshot)
+            .expect("read old credentials snapshot");
+        let old_credentials: crate::auth::StoredCredentials =
+            serde_json::from_str(&old_snapshot).expect("old snapshot remains valid JSON");
+        assert_eq!(old_credentials.access_token, "old-access-token");
+        assert_eq!(
+            crate::auth::load_credentials()
+                .expect("load current credentials")
+                .expect("current credentials")
+                .access_token,
+            "new-access-token"
+        );
+    }
+
+    #[actix_web::test]
+    async fn proxy_retries_a_401_with_rotated_oidc_credentials() {
+        let scope = TestCredentialsScope::new();
+        scope.write_credentials("old-access-token");
+        let auth_method = AuthMethod::resolve(None, true, None, None, None)
+            .expect("initial OIDC credentials should resolve");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock upstream");
+        listener
+            .set_nonblocking(true)
+            .expect("make mock upstream nonblocking");
+        let upstream = format!("http://{}", listener.local_addr().expect("local addr"));
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut observed = Vec::new();
+            while observed.len() < 2 && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept upstream request: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .expect("set mock read timeout");
+                let mut buffer = [0_u8; 4096];
+                let n = stream.read(&mut buffer).expect("read upstream request");
+                let request = String::from_utf8_lossy(&buffer[..n]);
+                observed.push(forwarded_fence_auth(&request));
+                if observed.len() == 1 {
+                    write_test_credentials("new-access-token");
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\nconnection: close\r\ncontent-length: 26\r\n\r\nInvalid X-Fence-Auth token",
+                        )
+                        .expect("write auth rejection");
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{\"ok\":true}",
+                        )
+                        .expect("write successful retry");
+                }
+            }
+            observed
+        });
+
+        let state = web::Data::new(ProxyState {
+            fence_url: upstream,
+            auth_method,
+            correlation_headers: Vec::new(),
+            local_api_key: None,
+            subscription_mode: false,
+            provider_auth_env_var: None,
+            protocol_diffs_dir: None,
+            observe_request_duration: |_| {},
+        });
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(state)
+                .default_service(web::to(proxy_handler)),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::post()
+            .uri("/v1/responses")
+            .set_payload("{}")
+            .to_request();
+        let response = actix_web::test::call_service(&app, req).await;
+        assert_eq!(response.status(), ActixStatus::OK);
+
+        let observed = server.join().expect("mock upstream should complete");
+        assert_eq!(
+            observed,
+            vec![
+                "Bearer old-access-token".to_string(),
+                "Bearer new-access-token".to_string()
+            ]
+        );
+    }
+
+    #[actix_web::test]
+    async fn proxy_refreshes_rejected_oidc_credentials_and_retries_the_request() {
+        let scope = TestCredentialsScope::new();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock fence and issuer");
+        listener
+            .set_nonblocking(true)
+            .expect("make mock server nonblocking");
+        let upstream = format!("http://{}", listener.local_addr().expect("local addr"));
+        scope.write_credentials_for_issuer(
+            "rejected-access-token",
+            "rotating-refresh-token",
+            &upstream,
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        let token_endpoint = format!("{upstream}/token");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut observed_auth = Vec::new();
+            let mut refresh_calls = 0;
+            while Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept mock request: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .expect("set mock read timeout");
+                let mut buffer = [0_u8; 8192];
+                let bytes_read = stream.read(&mut buffer).expect("read mock request");
+                let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default();
+                let (status, body) = match path {
+                    "/.well-known/openid-configuration" => (
+                        "200 OK",
+                        serde_json::json!({
+                            "device_authorization_endpoint": format!("{token_endpoint}/device"),
+                            "token_endpoint": token_endpoint,
+                        })
+                        .to_string(),
+                    ),
+                    "/token" => {
+                        refresh_calls += 1;
+                        (
+                            "200 OK",
+                            serde_json::json!({
+                                "access_token": "refreshed-access-token",
+                                "refresh_token": "rotated-refresh-token",
+                                "expires_in": 3600,
+                                "token_type": "Bearer",
+                            })
+                            .to_string(),
+                        )
+                    }
+                    "/v1/responses" => {
+                        let auth = forwarded_fence_auth(&request);
+                        observed_auth.push(auth.clone());
+                        if auth == "Bearer refreshed-access-token" {
+                            let body = serde_json::json!({"ok": true}).to_string();
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            stream
+                                .write_all(response.as_bytes())
+                                .expect("write successful response");
+                            return (observed_auth, refresh_calls);
+                        }
+                        ("401 Unauthorized", "Invalid X-Fence-Auth token".to_string())
+                    }
+                    _ => panic!("unexpected mock path: {path}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write mock response");
+            }
+            (observed_auth, refresh_calls)
+        });
+
+        let state = web::Data::new(ProxyState {
+            fence_url: upstream,
+            auth_method: AuthMethod::OidcTokenFile(
+                crate::auth::credentials_path().expect("credential path"),
+            ),
+            correlation_headers: Vec::new(),
+            local_api_key: None,
+            subscription_mode: false,
+            provider_auth_env_var: None,
+            protocol_diffs_dir: None,
+            observe_request_duration: |_| {},
+        });
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(state)
+                .default_service(web::to(proxy_handler)),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::post()
+            .uri("/v1/responses")
+            .set_payload("{}")
+            .to_request();
+        let response = actix_web::test::call_service(&app, req).await;
+        assert_eq!(response.status(), ActixStatus::OK);
+
+        let (observed_auth, refresh_calls) = server.join().expect("mock server should complete");
+        assert_eq!(refresh_calls, 1);
+        assert_eq!(
+            observed_auth,
+            vec![
+                "Bearer rejected-access-token".to_string(),
+                "Bearer refreshed-access-token".to_string(),
+            ]
+        );
+    }
+
+    #[actix_web::test]
+    async fn websocket_handshake_refreshes_rejected_oidc_credentials() {
+        #[derive(Clone)]
+        struct RefreshServerState {
+            token_endpoint: String,
+            refresh_calls: Arc<AtomicUsize>,
+        }
+
+        async fn oidc_discovery(
+            state: web::Data<RefreshServerState>,
+        ) -> web::Json<serde_json::Value> {
+            web::Json(serde_json::json!({
+                "device_authorization_endpoint": format!("{}/device", state.token_endpoint),
+                "token_endpoint": state.token_endpoint,
+            }))
+        }
+
+        async fn oidc_refresh(
+            state: web::Data<RefreshServerState>,
+        ) -> web::Json<serde_json::Value> {
+            state.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            web::Json(serde_json::json!({
+                "access_token": "new-access-token",
+                "refresh_token": "new-refresh-token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            }))
+        }
+
+        async fn refreshing_upstream(
+            req: HttpRequest,
+            payload: web::Payload,
+        ) -> Result<HttpResponse, actix_web::Error> {
+            let auth = req
+                .headers()
+                .get("x-fence-auth")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if auth == "Bearer old-access-token" {
+                return Ok(HttpResponse::Unauthorized().finish());
+            }
+            assert_eq!(auth, "Bearer new-access-token");
+            let (response, _session, _stream) = actix_ws::handle(&req, payload)?;
+            Ok(response)
+        }
+
+        let scope = TestCredentialsScope::new();
+        let upstream_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream port");
+        let upstream = format!(
+            "http://{}",
+            upstream_listener.local_addr().expect("upstream addr")
+        );
+        let upstream_url = format!("{upstream}/v1/responses");
+        scope.write_credentials_for_issuer(
+            "old-access-token",
+            "old-refresh-token",
+            &upstream,
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_state = RefreshServerState {
+            token_endpoint: format!("{upstream}/token"),
+            refresh_calls: Arc::clone(&refresh_calls),
+        };
+        let upstream_server = HttpServer::new(move || {
+            App::new()
+                .app_data(web::Data::new(refresh_state.clone()))
+                .route(
+                    "/.well-known/openid-configuration",
+                    web::get().to(oidc_discovery),
+                )
+                .route("/token", web::post().to(oidc_refresh))
+                .route("/v1/responses", web::get().to(refreshing_upstream))
+        })
+        .listen(upstream_listener)
+        .expect("listen upstream")
+        .run();
+        let upstream_handle = upstream_server.handle();
+        actix_web::rt::spawn(upstream_server);
+
+        let state = ProxyState {
+            fence_url: upstream.clone(),
+            auth_method: AuthMethod::resolve(None, true, None, None, None)
+                .expect("resolve file-backed OIDC auth"),
+            correlation_headers: Vec::new(),
+            local_api_key: None,
+            subscription_mode: false,
+            provider_auth_env_var: None,
+            protocol_diffs_dir: None,
+            observe_request_duration: |_| {},
+        };
+        let request_context = actix_web::test::TestRequest::get()
+            .uri("/v1/responses")
+            .to_http_request();
+        let request = build_upstream_websocket_request(&request_context, &state, &upstream_url)
+            .expect("build upstream WebSocket request");
+        let websocket = tokio::time::timeout(
+            Duration::from_secs(1),
+            connect_upstream_websocket_with_auth_reload(
+                request,
+                &request_context,
+                &state,
+                &upstream_url,
+                |_| {},
+            ),
+        )
+        .await
+        .expect("rotated OIDC handshake should complete promptly")
+        .expect("rotated OIDC handshake should succeed");
+        drop(websocket);
+
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+        let refreshed = crate::auth::load_credentials()
+            .expect("load refreshed credentials")
+            .expect("refreshed credentials");
+        assert_eq!(refreshed.access_token, "new-access-token");
+        assert_eq!(
+            refreshed.refresh_token.as_deref(),
+            Some("new-refresh-token")
+        );
+
+        upstream_handle.stop(true).await;
+    }
+
+    #[test]
+    fn proxy_auth_retry_detection_does_not_match_provider_errors() {
+        assert!(is_fence_auth_rejection(b"Invalid X-Fence-Auth token"));
+        assert!(is_fence_auth_rejection(
+            b"authentication required (X-Fence-Auth header)"
+        ));
+        assert!(!is_fence_auth_rejection(b"Invalid provider token"));
+        assert!(!is_fence_auth_rejection(b"Upstream provider error"));
+    }
+
+    #[test]
+    fn websocket_oidc_refresh_failure_is_safe_and_actionable() {
+        let payload = websocket_connect_error_payload(
+            &LocalProxyUpstreamWebSocketError::AuthenticationRefresh {
+                error: anyhow::anyhow!("provider detail with secret-refresh-token"),
+            },
+        );
+
+        assert_eq!(payload["status"], 401);
+        assert_eq!(payload["error"]["code"], "oidc_refresh_failed");
+        assert!(payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("ai-fence-cli login")));
+        assert!(!payload.to_string().contains("secret-refresh-token"));
+    }
 
     fn allocate_proxy_test_port() -> u16 {
         for _ in 0..1000 {
@@ -1457,6 +2704,78 @@ mod tests {
         assert_eq!(body["usage"]["input_tokens"], 10);
         assert_eq!(body["usage"]["output_tokens"], 2);
         server.join().expect("mock upstream should complete");
+    }
+
+    #[test]
+    fn synthesized_non_streaming_message_parses_split_tool_use_input() {
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tools\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"run_bash\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"echo hello\\\"}\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":6}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (body, had_stream_error) =
+            synthesize_anthropic_message_json(stream.as_bytes()).expect("synthesize");
+        assert!(!had_stream_error);
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let block = &value["content"][0];
+        assert_eq!(block["type"], "tool_use");
+        assert_eq!(block["name"], "run_bash");
+        assert_eq!(
+            block["input"],
+            serde_json::json!({"command": "echo hello"}),
+            "aggregated partial json must be parsed into input so non-streaming clients see the arguments"
+        );
+        assert!(
+            block.get("partial_json").is_none(),
+            "streaming-only field must not leak into a non-streaming message"
+        );
+        assert_eq!(value["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn synthesized_message_keeps_complete_tool_use_input_untouched() {
+        let stream = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_2\",\"name\":\"create\",\"input\":{\"filename\":\"a.txt\"}}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (body, had_stream_error) =
+            synthesize_anthropic_message_json(stream.as_bytes()).expect("synthesize");
+        assert!(!had_stream_error);
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            value["content"][0]["input"],
+            serde_json::json!({"filename": "a.txt"})
+        );
+    }
+
+    #[test]
+    fn finalize_aggregated_tool_use_handles_degenerate_blocks() {
+        // Unparseable fragments fall back to an empty object instead of a
+        // string-typed input, and non-tool blocks are left alone.
+        let mut broken = serde_json::json!(
+            {"type": "tool_use", "id": "c", "name": "n", "input": {}, "partial_json": "{not-json"}
+        );
+        finalize_aggregated_tool_use(&mut broken);
+        assert_eq!(broken["input"], serde_json::json!({}));
+        assert!(broken.get("partial_json").is_none());
+
+        let mut text = serde_json::json!({"type": "text", "text": "", "partial_json": "{}"});
+        finalize_aggregated_tool_use(&mut text);
+        assert_eq!(
+            text["partial_json"], "{}",
+            "only tool_use blocks are finalized"
+        );
     }
 
     #[actix_web::test]
@@ -1679,6 +2998,173 @@ mod tests {
         assert_eq!(resp.status(), ActixStatus::OK);
         server.join().expect("mock upstream should complete");
         std::env::remove_var("AI_FENCE_PROXY_TEST_PROVIDER_TOKEN");
+    }
+
+    #[actix_web::test]
+    async fn upstream_websocket_401_fails_fast_with_safe_auth_error() {
+        async fn unauthorized_upstream() -> HttpResponse {
+            // The proxy must not expose an upstream response body, which may
+            // contain provider-specific diagnostic data.
+            HttpResponse::Unauthorized().body("provider diagnostic: do not forward")
+        }
+
+        let upstream_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream port");
+        let upstream = format!(
+            "http://{}",
+            upstream_listener.local_addr().expect("upstream addr")
+        );
+        let upstream_server = HttpServer::new(|| {
+            App::new().route("/v1/responses", web::get().to(unauthorized_upstream))
+        })
+        .listen(upstream_listener)
+        .expect("listen upstream")
+        .run();
+        let upstream_handle = upstream_server.handle();
+        actix_web::rt::spawn(upstream_server);
+
+        let request = format!(
+            "{}/v1/responses",
+            websocket_url(&upstream).expect("WebSocket URL")
+        )
+        .into_client_request()
+        .expect("build upstream WebSocket request");
+        let connect_started = Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_millis(500),
+            connect_local_proxy_upstream_websocket(request, |_| {}),
+        )
+        .await
+        .expect("401 should not enter the retry window")
+        .expect_err("401 should reject the WebSocket handshake");
+        assert!(
+            connect_started.elapsed() < Duration::from_millis(500),
+            "401 should fail fast rather than wait for the retry deadline"
+        );
+        assert!(matches!(
+            &error,
+            LocalProxyUpstreamWebSocketError::PermanentHandshake {
+                upstream_status: 401
+            }
+        ));
+
+        let payload = websocket_connect_error_payload(&error);
+        assert_eq!(payload["status"], 401);
+        assert_eq!(payload["error"]["type"], "authentication_error");
+        assert_eq!(payload["error"]["code"], "upstream_authentication_failed");
+        assert!(payload["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("Restart Codex"));
+        assert!(
+            !payload.to_string().contains("provider diagnostic"),
+            "upstream response bodies must remain private"
+        );
+
+        // A rejected WebSocket handshake can leave the mock HTTP connection
+        // counted as active while its error response is being torn down. A
+        // graceful stop can then wait indefinitely under parallel CI load,
+        // even though this test has already observed the complete response.
+        upstream_handle.stop(false).await;
+    }
+
+    #[actix_web::test]
+    async fn upstream_websocket_5xx_retries_until_the_handshake_succeeds() {
+        async fn temporarily_unavailable_upstream(
+            req: HttpRequest,
+            payload: web::Payload,
+            attempts: web::Data<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+        ) -> Result<HttpResponse, actix_web::Error> {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(HttpResponse::ServiceUnavailable().finish());
+            }
+
+            let (response, _session, _stream) = actix_ws::handle(&req, payload)?;
+            Ok(response)
+        }
+
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upstream_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream port");
+        let upstream = format!(
+            "http://{}",
+            upstream_listener.local_addr().expect("upstream addr")
+        );
+        let attempts_for_server = attempts.clone();
+        let upstream_server = HttpServer::new(move || {
+            App::new()
+                .app_data(web::Data::new(attempts_for_server.clone()))
+                .route(
+                    "/v1/responses",
+                    web::get().to(temporarily_unavailable_upstream),
+                )
+        })
+        .listen(upstream_listener)
+        .expect("listen upstream")
+        .run();
+        let upstream_handle = upstream_server.handle();
+        actix_web::rt::spawn(upstream_server);
+
+        let request = format!(
+            "{}/v1/responses",
+            websocket_url(&upstream).expect("WebSocket URL")
+        )
+        .into_client_request()
+        .expect("build upstream WebSocket request");
+        let websocket = tokio::time::timeout(
+            Duration::from_secs(1),
+            connect_local_proxy_upstream_websocket(request, |_| {}),
+        )
+        .await
+        .expect("transient 5xx should retry before the retry deadline")
+        .expect("second handshake should succeed");
+        drop(websocket);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "a 503 handshake response should be retried"
+        );
+
+        upstream_handle.stop(true).await;
+    }
+
+    #[test]
+    fn upstream_websocket_520_remains_retryable_and_reports_gateway_guidance() {
+        assert!(
+            is_permanent_upstream_websocket_handshake_status(407),
+            "proxy authentication cannot recover through deployment retries"
+        );
+        assert!(
+            !is_permanent_upstream_websocket_handshake_status(520),
+            "opaque upstream gateway failures must remain retryable"
+        );
+
+        let response = tungstenite::http::Response::builder()
+            .status(520)
+            .body(Some(Vec::from("provider diagnostic: do not forward")))
+            .expect("build 520 response");
+        let error =
+            LocalProxyUpstreamWebSocketError::from_tungstenite(tungstenite::Error::Http(response));
+
+        assert!(matches!(
+            &error,
+            LocalProxyUpstreamWebSocketError::Unavailable {
+                last_handshake_status: Some(520),
+                ..
+            }
+        ));
+        let payload = websocket_connect_error_payload(&error);
+        assert_eq!(payload["status"], 502);
+        assert_eq!(payload["error"]["code"], "upstream_gateway_error");
+        assert_eq!(payload["error"]["upstream_status"], 520);
+        assert!(payload["error"]["message"]
+            .as_str()
+            .expect("gateway error message")
+            .contains("provider authentication"));
+        assert!(
+            !payload.to_string().contains("provider diagnostic"),
+            "upstream response bodies must remain private"
+        );
     }
 
     #[actix_web::test]
@@ -1991,6 +3477,15 @@ mod tests {
                 .app_data(web::Data::new(attempts_for_server.clone()))
                 .route("/v1/responses", web::get().to(reconnecting_upstream))
         })
+        // Dropping the session must actually tear the connection down so the
+        // proxy can observe the idle drop. actix-http >= 3.13 lingers for the
+        // server's client_disconnect_timeout (1s by default) after a WebSocket
+        // body ends with an unfinished request payload, silently discarding
+        // frames; the proxy then only learns the upstream is gone after it has
+        // forwarded the client's message, which correctly fails that request
+        // without replay. Disabling the linger restores the abrupt-drop
+        // fixture this test is about on both actix-http lines.
+        .client_disconnect_timeout(Duration::ZERO)
         .listen(upstream_listener)
         .expect("listen upstream")
         .run();
@@ -2064,6 +3559,394 @@ mod tests {
             "proxy should reconnect upstream after idle drop"
         );
 
+        // Close the active client connection before waiting for the blocking
+        // proxy runtime to stop. Otherwise graceful server shutdown can wait
+        // indefinitely for this test-owned WebSocket under parallel CI load.
+        drop(ws);
+        let _ = shutdown_tx.send(());
+        proxy_thread.join().expect("proxy thread should not panic");
+        upstream_handle.stop(true).await;
+    }
+
+    #[actix_web::test]
+    async fn proxy_keeps_local_websocket_open_until_deployed_upstream_returns() {
+        async fn echo_upstream(
+            req: HttpRequest,
+            payload: web::Payload,
+        ) -> Result<HttpResponse, actix_web::Error> {
+            let (response, mut session, stream) = actix_ws::handle(&req, payload)?;
+            actix_web::rt::spawn(async move {
+                let mut stream = stream.aggregate_continuations();
+                if let Some(Ok(AggregatedMessage::Text(text))) = stream.next().await {
+                    let _ = session.text(text.to_string()).await;
+                }
+            });
+            Ok(response)
+        }
+
+        let upstream_port = allocate_proxy_test_port();
+        let upstream = format!("http://127.0.0.1:{upstream_port}");
+        let proxy_port = allocate_proxy_test_port();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let proxy_thread = std::thread::spawn(move || {
+            ready_tx.send(()).expect("signal proxy starting");
+            run_proxy_until_shutdown_blocking(
+                ProxyConfig {
+                    fence_url: upstream,
+                    auth_method: AuthMethod::MasterKey("test-master".to_string()),
+                    listen_port: proxy_port,
+                    correlation_headers: Vec::new(),
+                    local_api_key: None,
+                    subscription_mode: false,
+                    provider_auth_env_var: None,
+                    protocol_diffs_dir: None,
+                    verbose: false,
+                    observe_request_duration: |_| {},
+                },
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .expect("proxy exits cleanly");
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("proxy thread should start");
+
+        let mut last_err = None;
+        let (mut ws, _) = 'connect: {
+            for _ in 0..20 {
+                match tokio_tungstenite::connect_async(format!(
+                    "ws://127.0.0.1:{proxy_port}/v1/responses"
+                ))
+                .await
+                {
+                    Ok(value) => break 'connect value,
+                    Err(err) => {
+                        last_err = Some(err);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+            panic!("proxy did not accept websocket requests: {last_err:?}");
+        };
+        ws.send(TungsteniteMessage::Text("during-deployment".into()))
+            .await
+            .expect("local WebSocket should remain writable while upstream is unavailable");
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let upstream_listener =
+            std::net::TcpListener::bind(("127.0.0.1", upstream_port)).expect("bind upstream");
+        let upstream_server = HttpServer::new(move || {
+            App::new().route("/v1/responses", web::get().to(echo_upstream))
+        })
+        .listen(upstream_listener)
+        .expect("listen upstream")
+        .run();
+        let upstream_handle = upstream_server.handle();
+        actix_web::rt::spawn(upstream_server);
+
+        let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("timed out waiting for recovered upstream")
+            .expect("local WebSocket should remain open")
+            .expect("recovered frame should read");
+        match msg {
+            TungsteniteMessage::Text(text) => assert_eq!(text, "during-deployment"),
+            other => panic!("expected echoed WebSocket text frame, got {other:?}"),
+        }
+
+        let _ = shutdown_tx.send(());
+        proxy_thread.join().expect("proxy thread should not panic");
+        upstream_handle.stop(true).await;
+    }
+
+    #[actix_web::test]
+    async fn proxy_recovers_next_turn_after_bounded_upstream_outage_without_replaying_failed_turn()
+    {
+        async fn echo_upstream(
+            req: HttpRequest,
+            payload: web::Payload,
+            received: web::Data<std::sync::mpsc::Sender<String>>,
+        ) -> Result<HttpResponse, actix_web::Error> {
+            let (response, mut session, stream) = actix_ws::handle(&req, payload)?;
+            let received = received.get_ref().clone();
+            actix_web::rt::spawn(async move {
+                let mut stream = stream.aggregate_continuations();
+                if let Some(Ok(AggregatedMessage::Text(text))) = stream.next().await {
+                    let text = text.to_string();
+                    let _ = received.send(text.clone());
+                    let _ = session.text(text).await;
+                }
+            });
+            Ok(response)
+        }
+
+        // Leave this port without a listener until the first bounded retry
+        // window has elapsed. The first client frame must receive an error,
+        // but the local WebSocket must stay usable for the later frame.
+        let upstream_port = allocate_proxy_test_port();
+        let upstream = format!("http://127.0.0.1:{upstream_port}");
+        let proxy_port = allocate_proxy_test_port();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let proxy_thread = std::thread::spawn(move || {
+            ready_tx.send(()).expect("signal proxy starting");
+            run_proxy_until_shutdown_blocking(
+                ProxyConfig {
+                    fence_url: upstream,
+                    auth_method: AuthMethod::MasterKey("test-master".to_string()),
+                    listen_port: proxy_port,
+                    correlation_headers: Vec::new(),
+                    local_api_key: None,
+                    subscription_mode: false,
+                    provider_auth_env_var: None,
+                    protocol_diffs_dir: None,
+                    verbose: false,
+                    observe_request_duration: |_| {},
+                },
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .expect("proxy exits cleanly");
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("proxy thread should start");
+
+        let mut last_err = None;
+        let (mut ws, _) = 'connect: {
+            for _ in 0..20 {
+                match tokio_tungstenite::connect_async(format!(
+                    "ws://127.0.0.1:{proxy_port}/v1/responses"
+                ))
+                .await
+                {
+                    Ok(value) => break 'connect value,
+                    Err(err) => {
+                        last_err = Some(err);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+            panic!("proxy did not accept websocket requests: {last_err:?}");
+        };
+
+        ws.send(TungsteniteMessage::Text("failed-turn".into()))
+            .await
+            .expect("failed turn should reach the local proxy");
+        let failure = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("bounded upstream retry should produce an error event")
+            .expect("local WebSocket must remain open after failed turn")
+            .expect("failed-turn error frame should read");
+        let TungsteniteMessage::Text(failure) = failure else {
+            panic!("expected a failed-turn error text frame, got {failure:?}");
+        };
+        let failure: serde_json::Value =
+            serde_json::from_str(&failure).expect("failed-turn error should be JSON");
+        assert_eq!(failure["type"], "error");
+        assert_eq!(failure["status"], 502);
+
+        let (received_tx, received_rx) = mpsc::channel::<String>();
+        let upstream_listener =
+            std::net::TcpListener::bind(("127.0.0.1", upstream_port)).expect("bind upstream");
+        let upstream_server = HttpServer::new(move || {
+            App::new()
+                .app_data(web::Data::new(received_tx.clone()))
+                .route("/v1/responses", web::get().to(echo_upstream))
+        })
+        .listen(upstream_listener)
+        .expect("listen upstream")
+        .run();
+        let upstream_handle = upstream_server.handle();
+        actix_web::rt::spawn(upstream_server);
+
+        ws.send(TungsteniteMessage::Text("next-turn".into()))
+            .await
+            .expect("next turn should be accepted on the same local WebSocket");
+        let recovered = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("next turn should reconnect to the recovered upstream")
+            .expect("local WebSocket should remain open after recovery")
+            .expect("recovered frame should read");
+        match recovered {
+            TungsteniteMessage::Text(text) => assert_eq!(text, "next-turn"),
+            other => panic!("expected echoed next-turn frame, got {other:?}"),
+        }
+        assert_eq!(
+            received_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("recovered upstream should receive next turn"),
+            "next-turn"
+        );
+        assert!(
+            received_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "failed turn must not be replayed after recovery"
+        );
+
+        drop(ws);
+        let _ = shutdown_tx.send(());
+        proxy_thread.join().expect("proxy thread should not panic");
+        upstream_handle.stop(true).await;
+    }
+
+    #[actix_web::test]
+    async fn proxy_recovers_after_in_flight_upstream_drop_without_replaying_turn() {
+        async fn upstream_that_drops_first_turn(
+            req: HttpRequest,
+            payload: web::Payload,
+            attempts: web::Data<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+            received: web::Data<std::sync::mpsc::Sender<String>>,
+        ) -> Result<HttpResponse, actix_web::Error> {
+            let (response, mut session, stream) = actix_ws::handle(&req, payload)?;
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let received = received.get_ref().clone();
+            actix_web::rt::spawn(async move {
+                let mut stream = stream.aggregate_continuations();
+                if let Some(Ok(AggregatedMessage::Text(text))) = stream.next().await {
+                    let text = text.to_string();
+                    let _ = received.send(text.clone());
+                    if attempt == 0 {
+                        // The proxy cannot know whether this first turn made
+                        // it far enough upstream to have side effects. Drop
+                        // the connection without a terminal response.
+                        drop(session);
+                    } else {
+                        let _ = session.text(text).await;
+                    }
+                }
+            });
+            Ok(response)
+        }
+
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (received_tx, received_rx) = mpsc::channel::<String>();
+        let upstream_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream port");
+        let upstream = format!(
+            "http://{}",
+            upstream_listener.local_addr().expect("upstream address")
+        );
+        let attempts_for_server = attempts.clone();
+        let upstream_server = HttpServer::new(move || {
+            App::new()
+                .app_data(web::Data::new(attempts_for_server.clone()))
+                .app_data(web::Data::new(received_tx.clone()))
+                .route(
+                    "/v1/responses",
+                    web::get().to(upstream_that_drops_first_turn),
+                )
+        })
+        .listen(upstream_listener)
+        .expect("listen upstream")
+        .run();
+        let upstream_handle = upstream_server.handle();
+        actix_web::rt::spawn(upstream_server);
+
+        let proxy_port = allocate_proxy_test_port();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let proxy_thread = std::thread::spawn(move || {
+            ready_tx.send(()).expect("signal proxy starting");
+            run_proxy_until_shutdown_blocking(
+                ProxyConfig {
+                    fence_url: upstream,
+                    auth_method: AuthMethod::MasterKey("test-master".to_string()),
+                    listen_port: proxy_port,
+                    correlation_headers: Vec::new(),
+                    local_api_key: None,
+                    subscription_mode: false,
+                    provider_auth_env_var: None,
+                    protocol_diffs_dir: None,
+                    verbose: false,
+                    observe_request_duration: |_| {},
+                },
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .expect("proxy exits cleanly");
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("proxy thread should start");
+
+        let mut last_err = None;
+        let (mut ws, _) = 'connect: {
+            for _ in 0..20 {
+                match tokio_tungstenite::connect_async(format!(
+                    "ws://127.0.0.1:{proxy_port}/v1/responses"
+                ))
+                .await
+                {
+                    Ok(value) => break 'connect value,
+                    Err(err) => {
+                        last_err = Some(err);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+            panic!("proxy did not accept websocket requests: {last_err:?}");
+        };
+
+        ws.send(TungsteniteMessage::Text("failed-turn".into()))
+            .await
+            .expect("first turn should reach the local proxy");
+        let failure = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("in-flight upstream loss should fail the current turn")
+            .expect("local WebSocket must remain open after in-flight loss")
+            .expect("in-flight failure frame should read");
+        let TungsteniteMessage::Text(failure) = failure else {
+            panic!("expected an in-flight failure error frame, got {failure:?}");
+        };
+        let failure: serde_json::Value =
+            serde_json::from_str(&failure).expect("in-flight failure should be JSON");
+        assert_eq!(failure["type"], "error");
+        assert_eq!(failure["status"], 502);
+
+        ws.send(TungsteniteMessage::Text("next-turn".into()))
+            .await
+            .expect("next turn should be accepted on the same local WebSocket");
+        let recovered = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("next turn should reconnect after the in-flight loss")
+            .expect("local WebSocket should remain open after recovery")
+            .expect("recovered frame should read");
+        match recovered {
+            TungsteniteMessage::Text(text) => assert_eq!(text, "next-turn"),
+            other => panic!("expected echoed next-turn frame, got {other:?}"),
+        }
+        assert_eq!(
+            received_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("upstream should receive the failed turn once"),
+            "failed-turn"
+        );
+        assert_eq!(
+            received_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("upstream should receive the recovered turn"),
+            "next-turn"
+        );
+        assert!(
+            received_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "the ambiguous failed turn must not be replayed"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "only the new turn should establish the replacement upstream connection"
+        );
+
+        drop(ws);
         let _ = shutdown_tx.send(());
         proxy_thread.join().expect("proxy thread should not panic");
         upstream_handle.stop(true).await;

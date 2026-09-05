@@ -1,6 +1,7 @@
 pub mod agent_launcher;
 pub mod auth;
 pub mod config;
+pub mod open_interpreter;
 pub mod proxy;
 
 #[cfg(test)]
@@ -14,6 +15,7 @@ mod boundary_tests {
             include_str!("agent_launcher.rs"),
             include_str!("auth.rs"),
             include_str!("config.rs"),
+            include_str!("open_interpreter.rs"),
             include_str!("proxy.rs"),
         ];
         for source in sources {
