@@ -2,7 +2,7 @@
 
 Do not include credentials, provider auth files, request payloads, proprietary
 source, protocol diffs, or sensitive logs. Report vulnerabilities through
-[GitHub private vulnerability reporting](https://github.com/matthid/ai-fence-cli/security/advisories/new),
+[GitHub private vulnerability reporting](https://github.com/Yilnic/ai-fence-cli/security/advisories/new),
 not this public issue.
 
 ## Environment

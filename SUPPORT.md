@@ -3,7 +3,7 @@
 Use the public issue tracker for reproducible problems in the free CLI or the
 public Rust workspace:
 
-- GitHub: https://github.com/matthid/ai-fence-cli/issues
+- GitHub: https://github.com/Yilnic/ai-fence-cli/issues
 - GitLab: https://gitlab.com/matthid-ml/ai-fence-cli/-/issues
 
 Before filing an issue, check the

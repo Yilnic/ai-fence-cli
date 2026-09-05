@@ -8,7 +8,7 @@ to the latest version before reporting a problem that may already be fixed.
 ## Reporting a vulnerability
 
 Use
-[GitHub private vulnerability reporting](https://github.com/matthid/ai-fence-cli/security/advisories/new).
+[GitHub private vulnerability reporting](https://github.com/Yilnic/ai-fence-cli/security/advisories/new).
 Do not open a public GitHub issue, GitLab issue, discussion, or merge request for
 a suspected vulnerability.
 

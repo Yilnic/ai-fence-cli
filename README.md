@@ -54,7 +54,7 @@ provider tokens, request payloads, proprietary source, or sensitive logs in a
 public issue.
 
 Report vulnerabilities through
-[GitHub private vulnerability reporting](https://github.com/matthid/ai-fence-cli/security/advisories/new)
+[GitHub private vulnerability reporting](https://github.com/Yilnic/ai-fence-cli/security/advisories/new)
 and follow [SECURITY.md](SECURITY.md). Do not report a vulnerability in a public
 GitHub issue or GitLab issue.
 
@@ -62,7 +62,7 @@ Changes are accepted in either public mirror. Maintainers import contributions
 into the private integration repository, run its full compatibility suite, and
 publish the resulting subtree back to both mirrors.
 
-- GitHub: https://github.com/matthid/ai-fence-cli
+- GitHub: https://github.com/Yilnic/ai-fence-cli
 - GitLab: https://gitlab.com/matthid-ml/ai-fence-cli
 
 Public contribution commits retain their original author, message, and

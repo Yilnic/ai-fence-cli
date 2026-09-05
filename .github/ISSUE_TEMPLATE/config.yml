@@ -1,7 +1,7 @@
 blank_issues_enabled: false
 contact_links:
   - name: Private security report
-    url: https://github.com/matthid/ai-fence-cli/security/advisories/new
+    url: https://github.com/Yilnic/ai-fence-cli/security/advisories/new
     about: Report vulnerabilities without publishing sensitive details.
   - name: Quickstart and troubleshooting
     url: https://ai.yml.world/docs
