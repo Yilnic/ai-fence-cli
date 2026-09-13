@@ -1,0 +1,24 @@
+{
+  "repository": "Yilnic/ai-fence-cli",
+  "version": "0.1.2",
+  "artifacts": {
+    "linux-x86_64": {
+      "filename": "ai-fence-cli-linux-x86_64",
+      "source_url": "https://ai.yml.world/downloads/candidate/ai-fence-cli-linux-x86_64",
+      "sha256": "a91a8980a61c1d24472b8e47d5420b6ab64b3996836aa0847c41eeb0de7cdac7",
+      "size_bytes": 45834344
+    },
+    "windows-x86_64": {
+      "filename": "ai-fence-cli-windows-x86_64.exe",
+      "source_url": "https://ai.yml.world/downloads/candidate/ai-fence-cli-windows-x86_64.exe",
+      "sha256": "e7b91d00d6d221e6aad8fb7b6fc76c70307da4adc63c28b0ee9832988fead5bd",
+      "size_bytes": 59801615
+    },
+    "macos-aarch64": {
+      "filename": "ai-fence-cli-macos-aarch64",
+      "source_url": "https://ai.yml.world/downloads/candidate/ai-fence-cli-macos-aarch64",
+      "sha256": "3b4a591c57cd1ebe58d9d87b02f01de64ee1a6bba006639bd27e03cfe17e09d1",
+      "size_bytes": 39219136
+    }
+  }
+}

@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+pub mod subscription;
+
 /// Style of placeholder used when redacting sensitive data.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -37,6 +39,10 @@ pub struct GatewayMetadata {
     pub model: Option<String>,
     pub credential_pool_id: Option<String>,
     pub rental_reason: Option<String>,
+    /// Reserved funding claim. Retained only so unsupported semantics can be
+    /// rejected before issuance; it is not an accepted entitlement DTO.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding_binding: Option<Value>,
     /// Server-authored project policy evidence. Ordinary gateway callers
     /// cannot mint this metadata because policy-bound keys are created through
     /// the authenticated internal control-plane API.
@@ -68,6 +74,8 @@ pub struct GatewayPolicyBinding {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct CreateGatewayKeyRequest {
+    #[serde(flatten)]
+    pub requirements: subscription::GatewayIssueRequirements,
     #[serde(default = "default_scope")]
     pub scope: String,
     #[serde(default)]
@@ -90,6 +98,7 @@ impl CreateGatewayKeyRequest {
         allowed_models: Vec<String>,
     ) -> Self {
         Self {
+            requirements: Default::default(),
             scope: "session".to_string(),
             expires_in_seconds: Some(expires_in_seconds.min(i64::MAX as u64) as i64),
             metadata,
@@ -97,6 +106,12 @@ impl CreateGatewayKeyRequest {
             allowed_models,
             budget: None,
         }
+    }
+
+    pub fn requires_unavailable_semantics(&self) -> bool {
+        !self.requirements.required_capabilities.is_empty()
+            || self.requirements.issuance_id.is_some()
+            || self.metadata.funding_binding.is_some()
     }
 }
 
