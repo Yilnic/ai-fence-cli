@@ -28,6 +28,9 @@ signed rather than Developer ID signed and notarized. See the
 [quickstart](https://ai.yml.world/docs) for provider auth, standalone data flow,
 logging, and manual install details.
 
+For model access that works while `codex-apps` or `/usage` requests login, see
+[Codex native authentication limitations and safe next steps](CODEX_AUTH.md).
+
 ## Source boundary
 
 The proprietary request-processing engine is intentionally not part of this
