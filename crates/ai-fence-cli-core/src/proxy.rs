@@ -386,19 +386,19 @@ where
 }
 
 /// Shared state for the proxy.
-struct ProxyState {
-    fence_url: String,
-    auth_method: AuthMethod,
-    correlation_headers: Vec<(String, String)>,
-    local_api_key: Option<String>,
-    subscription_mode: bool,
-    provider_auth_env_var: Option<String>,
-    protocol_diffs_dir: Option<PathBuf>,
-    observe_request_duration: fn(f64),
+pub struct ProxyState {
+    pub fence_url: String,
+    pub auth_method: AuthMethod,
+    pub correlation_headers: Vec<(String, String)>,
+    pub local_api_key: Option<String>,
+    pub subscription_mode: bool,
+    pub provider_auth_env_var: Option<String>,
+    pub protocol_diffs_dir: Option<PathBuf>,
+    pub observe_request_duration: fn(f64),
 }
 
 /// Handle all incoming requests — forward to the fence server with auth injection.
-async fn proxy_handler(
+pub async fn proxy_handler(
     req: HttpRequest,
     payload: web::Payload,
     state: web::Data<ProxyState>,
@@ -559,6 +559,12 @@ async fn proxy_handler(
             .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
         let (body, had_stream_error) = synthesize_anthropic_message_json(&stream_body)?;
         if had_stream_error {
+            // Restore the retryable status riding inside the error envelope —
+            // otherwise the committed 200 makes the client see a "message" it
+            // cannot back off from.
+            if let Some(error_status) = reassembled_stream_error_status(&body) {
+                builder.status(error_status);
+            }
             warn_reassembled_stream_error(&req, &body);
         }
         builder.insert_header(("content-type", "application/json"));
@@ -741,18 +747,27 @@ fn is_anthropic_messages_path(path: &str) -> bool {
     )
 }
 
+/// The retryable status riding inside a reassembled error envelope
+/// (`error.status`), when it carries one. Envelopes without one keep the
+/// committed status.
+fn reassembled_stream_error_status(body: &[u8]) -> Option<ActixStatus> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let status = value.get("error")?.get("status")?.as_u64()? as u16;
+    ActixStatus::from_u16(status).ok()
+}
+
 /// Log a reassembled in-stream upstream error. The body is an error envelope
-/// (already sanitized by the backend) returned with a committed 200 status —
-/// the client sees "not a Message" instead of a retryable status, so this
-/// warn is the only local trace of the conversion.
+/// (already sanitized by the backend) that a committed 200 response carried;
+/// when it has `error.status`, that status is restored on the response so the
+/// client can back off. This warn is the local trace of the stream-to-JSON
+/// conversion.
 fn warn_reassembled_stream_error(req: &HttpRequest, body: &[u8]) {
     let value: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
     let error = value.get("error");
     warn!(
         path = %req.uri().path(),
-        status = error
-            .and_then(|e| e.get("status"))
-            .and_then(|s| s.as_u64())
+        status = reassembled_stream_error_status(body)
+            .map(|status| status.as_u16() as u64)
             .unwrap_or(0),
         error_type = error
             .and_then(|e| e.get("type"))
@@ -766,14 +781,20 @@ fn warn_reassembled_stream_error(req: &HttpRequest, body: &[u8]) {
     );
 }
 
-/// Terminal upstream SSE error frame prefix as emitted by the fence
-/// (`event: error\ndata: {"type":"error"...`). Matched as one marker so prose
-/// that merely discusses SSE errors cannot trip the scanner.
-const SSE_ERROR_FRAME_MARKER: &[u8] = b"event: error\ndata: {\"type\":\"error\"";
+/// Terminal upstream SSE error frame prefixes as emitted by the fence
+/// (`event: error\ndata: {"type":"error"...`). Matched as whole markers so
+/// prose that merely discusses SSE errors cannot trip the scanner. Two
+/// shapes are accepted: current fences serialize the envelope in documented
+/// field order (`{"type":"error",...}`), while older deployed fences used
+/// `json!`'s alphabetically sorted map (`{"error":...,"type":"error"}`).
+const SSE_ERROR_FRAME_MARKERS: [&[u8]; 2] = [
+    b"event: error\ndata: {\"type\":\"error\"",
+    b"event: error\ndata: {\"error\"",
+];
 
 /// Scans forwarded SSE chunks for terminal error frames across chunk
 /// boundaries without modifying the forwarded bytes. A carry buffer closes
-/// gaps when the marker splits across chunks.
+/// gaps when a marker splits across chunks.
 #[derive(Default)]
 struct SseErrorEventScanner {
     carry: Vec<u8>,
@@ -784,15 +805,17 @@ impl SseErrorEventScanner {
         let mut buf = Vec::with_capacity(self.carry.len() + chunk.len());
         buf.extend_from_slice(&self.carry);
         buf.extend_from_slice(chunk);
-        let found = buf
-            .windows(SSE_ERROR_FRAME_MARKER.len())
-            .any(|w| w == SSE_ERROR_FRAME_MARKER);
+        let found = SSE_ERROR_FRAME_MARKERS
+            .iter()
+            .any(|marker| buf.windows(marker.len()).any(|w| w == *marker));
         // Retain only a tail long enough to close a marker split across the
         // next chunk boundary.
-        let keep = SSE_ERROR_FRAME_MARKER
-            .len()
-            .saturating_sub(1)
-            .min(buf.len());
+        let longest = SSE_ERROR_FRAME_MARKERS
+            .iter()
+            .map(|marker| marker.len())
+            .max()
+            .unwrap_or(0);
+        let keep = longest.saturating_sub(1).min(buf.len());
         self.carry = buf[buf.len() - keep..].to_vec();
         found
     }
@@ -2704,6 +2727,131 @@ mod tests {
         assert_eq!(body["usage"]["input_tokens"], 10);
         assert_eq!(body["usage"]["output_tokens"], 2);
         server.join().expect("mock upstream should complete");
+    }
+
+    #[actix_web::test]
+    async fn proxy_returns_retryable_status_for_reassembled_stream_error() {
+        // A committed 200 stream carrying a terminal error frame (the fence
+        // keepalive path after exhausted upstream retries) must come back to
+        // the client with the retryable status the envelope carries, not the
+        // committed 200.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock fence");
+        let upstream = format!("http://{}", listener.local_addr().expect("local addr"));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fence request");
+            let mut buffer = [0_u8; 4096];
+            let n = stream.read(&mut buffer).expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..n]);
+            assert!(request.contains("POST /v1/messages"), "request: {request}");
+            assert!(
+                request.contains("\"stream\":true"),
+                "the fence request must force streaming; got: {request}"
+            );
+
+            // The keepalive phase: committed 200, a keepalive comment, a
+            // synthetic message_start, then the terminal error frame — exactly
+            // what the fence emits when upstream 429s before any output.
+            let body = concat!(
+                ": ai-fence keepalive\n\n",
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ai_fence_stream_error\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\"}}\n\n",
+                "event: error\n",
+                "data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"[1308][Usage limit reached for 5 hour. Your limit will reset at 2026-09-18 22:11:34][20260918213433e34f434395494ace]\",\"status\":429}}\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        let state = web::Data::new(ProxyState {
+            fence_url: upstream,
+            auth_method: AuthMethod::MasterKey("test-master".to_string()),
+            correlation_headers: Vec::new(),
+            local_api_key: None,
+            subscription_mode: false,
+            provider_auth_env_var: None,
+            protocol_diffs_dir: None,
+            observe_request_duration: |_| {},
+        });
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(state)
+                .default_service(web::to(proxy_handler)),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::post()
+            .uri("/v1/messages")
+            .insert_header(("content-type", "application/json"))
+            .set_payload(
+                serde_json::json!({
+                    "model": "glm-5.3-flash",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": false
+                })
+                .to_string(),
+            )
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(
+            resp.status(),
+            ActixStatus::TOO_MANY_REQUESTS,
+            "reassembled stream error must carry the retryable status, not the committed 200"
+        );
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let body = actix_web::test::read_body(resp).await;
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("reassembled body must stay JSON");
+        assert_eq!(
+            value.get("type"),
+            Some(&serde_json::Value::String("error".to_string()))
+        );
+        assert_eq!(value["error"]["type"], "rate_limit_error");
+        assert_eq!(value["error"]["status"], 429);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Usage limit reached")),
+            "envelope: {value:?}"
+        );
+        server.join().expect("mock fence should complete");
+    }
+
+    #[test]
+    fn sse_error_scanner_matches_both_fence_frame_orderings() {
+        // Current fences serialize the envelope with `type` first; older
+        // deployed fences used `json!`'s alphabetically sorted map, which no
+        // single marker matched. The scanner must recognize both, split
+        // across chunk boundaries included.
+        let documented: &[u8] = b": ai-fence keepalive\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"[1308][Usage limit reached]\",\"status\":429}}\n\n";
+        let alphabetical: &[u8] = b": ai-fence keepalive\n\nevent: error\ndata: {\"error\":{\"type\":\"rate_limit_error\",\"message\":\"[1308][Usage limit reached]\",\"status\":429},\"type\":\"error\"}\n\n";
+        for body in [documented, alphabetical] {
+            let mut scanner = SseErrorEventScanner::default();
+            // Split inside the marker itself so the carry buffer has to
+            // bridge the chunk boundary.
+            let marker_pos = body
+                .windows(b"event: error".len())
+                .position(|w| w == b"event: error")
+                .expect("body contains the terminal error frame");
+            let mid = marker_pos + 8;
+            assert!(
+                !scanner.scan(&body[..mid]),
+                "half a marker must not trip the scanner yet: {}",
+                String::from_utf8_lossy(&body[..mid])
+            );
+            assert!(
+                scanner.scan(&body[mid..]),
+                "the terminal error frame must be recognized: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     #[test]

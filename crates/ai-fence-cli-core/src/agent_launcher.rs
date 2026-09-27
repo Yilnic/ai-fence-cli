@@ -1203,6 +1203,9 @@ pub fn write_codex_config_with_model_selection(
     }
 
     insert_string_if_missing(&mut config, "cli_auth_credentials_store", "file");
+    // Recent Codex releases ignore this old setting and warn on every launch.
+    // The selected provider now determines which credential source to use.
+    config.remove("preferred_auth_method");
     let features = ensure_table(&mut config, "features");
     features
         .entry("responses_websockets".to_string())
@@ -1256,10 +1259,6 @@ pub fn write_codex_config_with_model_selection(
             );
             provider.remove("requires_openai_auth");
             provider.remove("auth");
-            config.insert(
-                "preferred_auth_method".to_string(),
-                toml::Value::String("apikey".to_string()),
-            );
         }
         CodexProviderAuth::EnvBearer { env_key } => {
             configure_codex_proxy_provider(&mut config, proxy_base);
@@ -1270,10 +1269,6 @@ pub fn write_codex_config_with_model_selection(
         }
         CodexProviderAuth::OpenAiAuth => {
             configure_codex_proxy_provider(&mut config, proxy_base);
-            config.insert(
-                "preferred_auth_method".to_string(),
-                toml::Value::String("chatgpt".to_string()),
-            );
             let provider = ensure_model_provider(&mut config);
             provider.insert(
                 "requires_openai_auth".to_string(),
@@ -3258,7 +3253,7 @@ mod tests {
         assert!(config.contains("base_url = \"http://127.0.0.1:1234/v1\""));
         assert!(config.contains("env_key = \"OPENAI_API_KEY\""));
         assert!(config.contains("supports_websockets = true"));
-        assert!(config.contains("preferred_auth_method = \"apikey\""));
+        assert!(!config.contains("preferred_auth_method"));
         assert!(!config.contains("openai_base_url"));
         assert!(!config.contains("requires_openai_auth"));
         assert!(config.contains("trust_level = \"trusted\""));
@@ -3879,9 +3874,8 @@ bearer_token_env_var = "PROJ_CREATOR_DEV_TOOL_TOKEN"
         assert!(config.contains("[model_providers.ai_fence]"));
         assert!(config.contains("base_url = \"http://127.0.0.1:1234/v1\""));
         assert!(config.contains("env_key = \"OPENAI_API_KEY\""));
-        assert!(config.contains("preferred_auth_method = \"apikey\""));
+        assert!(!config.contains("preferred_auth_method"));
         assert!(!config.contains("http://stale.example"));
-        assert!(!config.contains("preferred_auth_method = \"chatgpt\""));
     }
 
     #[test]
@@ -4449,13 +4443,13 @@ custom_user_setting = "keep"
         assert!(config.contains("model_provider = \"ai_fence\""));
         assert!(config.contains("[model_providers.ai_fence]"));
         assert!(config.contains("base_url = \"http://127.0.0.1:1234/v1\""));
-        assert!(config.contains("preferred_auth_method = \"chatgpt\""));
+        assert!(!config.contains("preferred_auth_method"));
         assert!(config.contains("requires_openai_auth = true"));
         assert!(!config.contains("env_key = \"OPENAI_API_KEY\""));
     }
 
     #[test]
-    fn write_codex_config_overwrites_template_auth_method_for_subscription_mode() {
+    fn write_codex_config_removes_template_auth_method_for_subscription_mode() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config_dir = temp.path().join(".ai-fence");
         let template_dir = config_dir.join(".codex");
@@ -4486,11 +4480,10 @@ model_catalog_json = "/tmp/stale-direct-model-catalog.json"
         assert!(config.contains("model_provider = \"ai_fence\""));
         assert!(config.contains("[model_providers.ai_fence]"));
         assert!(config.contains("base_url = \"http://127.0.0.1:1234/v1\""));
-        assert!(config.contains("preferred_auth_method = \"chatgpt\""));
+        assert!(!config.contains("preferred_auth_method"));
         assert!(config.contains("requires_openai_auth = true"));
         assert!(!config.contains("env_key = \"OPENAI_API_KEY\""));
         assert!(!config.contains("http://stale.example"));
-        assert!(!config.contains("preferred_auth_method = \"apikey\""));
         assert!(!config.contains("model_catalog_json"));
     }
 
