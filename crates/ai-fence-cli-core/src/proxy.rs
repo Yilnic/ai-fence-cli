@@ -2927,6 +2927,61 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn atomic_gateway_key_replacement_reaches_the_next_actual_proxy_request() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let key_path = temp.path().join("current-key");
+        std::fs::write(&key_path, "gw_live_reload_one").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for key in ["gw_live_reload_one", "gw_live_reload_two"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = [0u8; 4096];
+                let count = stream.read(&mut bytes).unwrap();
+                let request = String::from_utf8_lossy(&bytes[..count]);
+                assert!(request.contains(&format!("x-fence-auth: Bearer {key}")));
+                assert!(request.contains("authorization: Bearer synthetic-provider"));
+                stream.write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}").unwrap();
+            }
+        });
+        let state = web::Data::new(ProxyState {
+            fence_url: upstream,
+            auth_method: AuthMethod::GatewayKeyFile(key_path.clone()),
+            correlation_headers: vec![],
+            local_api_key: None,
+            subscription_mode: false,
+            provider_auth_env_var: None,
+            protocol_diffs_dir: None,
+            observe_request_duration: |_| {},
+        });
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(state)
+                .default_service(web::to(proxy_handler)),
+        )
+        .await;
+        for generation in [1, 2] {
+            if generation == 2 {
+                let mut pending = tempfile::NamedTempFile::new_in(temp.path()).unwrap();
+                pending.write_all(b"gw_live_reload_two").unwrap();
+                pending.as_file().sync_all().unwrap();
+                pending.persist(&key_path).unwrap();
+            }
+            let req = actix_web::test::TestRequest::post()
+                .uri("/v1/responses")
+                .insert_header(("authorization", "Bearer synthetic-provider"))
+                .set_payload("{}")
+                .to_request();
+            assert_eq!(
+                actix_web::test::call_service(&app, req).await.status(),
+                ActixStatus::OK
+            );
+        }
+        server.join().unwrap();
+    }
+
+    #[actix_web::test]
     async fn proxy_gateway_key_file_preserves_provider_authorization() {
         let temp = tempfile::tempdir().expect("tempdir");
         let key_path = temp.path().join("gateway-key");
