@@ -3,7 +3,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+pub mod application;
+pub mod application_cancellation;
+pub mod application_run;
 pub mod subscription;
+
+#[cfg(test)]
+mod usage_tests;
 
 /// Style of placeholder used when redacting sensitive data.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -212,6 +218,9 @@ pub struct ListResponse<T> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct GatewayUsage {
+    /// Provider-reported audio input duration. Never included in token totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_audio_ms: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
@@ -254,6 +263,8 @@ pub enum ProviderEndpointType {
     OpenAICompletions,
     #[serde(rename = "openai_embeddings")]
     OpenAIEmbeddings,
+    #[serde(rename = "openai_audio_transcriptions")]
+    OpenAIAudioTranscriptions,
     #[serde(rename = "openai_compatible_chat")]
     OpenAICompatibleChat,
     #[serde(rename = "anthropic_messages")]
@@ -267,6 +278,7 @@ impl ProviderEndpointType {
             Self::OpenAIChatCompletions => "openai_chat_completions",
             Self::OpenAICompletions => "openai_completions",
             Self::OpenAIEmbeddings => "openai_embeddings",
+            Self::OpenAIAudioTranscriptions => "openai_audio_transcriptions",
             Self::OpenAICompatibleChat => "openai_compatible_chat",
             Self::AnthropicMessages => "anthropic_messages",
         }
@@ -277,6 +289,7 @@ impl ProviderEndpointType {
             "openai_chat_completions" => Self::OpenAIChatCompletions,
             "openai_completions" => Self::OpenAICompletions,
             "openai_embeddings" => Self::OpenAIEmbeddings,
+            "openai_audio_transcriptions" => Self::OpenAIAudioTranscriptions,
             "openai_compatible_chat" => Self::OpenAICompatibleChat,
             "anthropic_messages" => Self::AnthropicMessages,
             _ => Self::OpenAIResponses,

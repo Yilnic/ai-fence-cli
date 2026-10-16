@@ -4,7 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-required='Cargo.toml README.md LICENSE crates/ai-fence-cli-core/Cargo.toml crates/ai-fence-contract/Cargo.toml crates/ai-fence-model-metadata/Cargo.toml'
+required='Cargo.toml README.md LICENSE crates/ai-fence-cli-core/Cargo.toml crates/ai-fence-client/Cargo.toml crates/ai-fence-contract/Cargo.toml crates/ai-fence-model-metadata/Cargo.toml'
 for path in $required; do
     if [ ! -f "$path" ]; then
         echo "public boundary: missing required file: $path" >&2

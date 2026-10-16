@@ -43,6 +43,8 @@ pub enum CliDefaultAgent {
     Codex,
     Claude,
     Interpreter,
+    #[serde(rename = "openclaw")]
+    OpenClaw,
     Junie,
     Pi,
     Dsh,
@@ -57,6 +59,7 @@ impl CliDefaultAgent {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Interpreter => "interpreter",
+            Self::OpenClaw => "openclaw",
             Self::Junie => "junie",
             Self::Pi => "pi",
             Self::Dsh => "dsh",

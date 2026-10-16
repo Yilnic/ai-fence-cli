@@ -1,0 +1,17 @@
+[package]
+name = "ai-fence-client"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded transport for managed AI Fence application connections"
+repository = "https://github.com/Yilnic/ai-fence-cli"
+readme = "../../README.md"
+
+[dependencies]
+ai-fence-contract = { path = "../ai-fence-contract" }
+reqwest = { version = "=0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+
+[dev-dependencies]
+tokio = { version = "=1.50.0", features = ["macros", "rt-multi-thread"] }

@@ -15,6 +15,8 @@ pub enum AgentKind {
     Codex,
     Claude,
     Interpreter,
+    #[value(name = "openclaw")]
+    OpenClaw,
     Junie,
     Pi,
     Dsh,
@@ -28,6 +30,7 @@ pub enum ResolvedAgent {
     Codex,
     Claude,
     Interpreter,
+    OpenClaw,
     Junie,
     Pi,
     Dsh,
@@ -243,6 +246,7 @@ impl ResolvedAgent {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Interpreter => "open interpreter",
+            Self::OpenClaw => "openclaw",
             Self::Junie => "junie",
             Self::Pi => "pi",
             Self::Dsh => "dsh",
@@ -259,6 +263,7 @@ pub fn resolve_launch(agent: AgentKind, command: &[String]) -> Result<LaunchSpec
         AgentKind::Codex => ResolvedAgent::Codex,
         AgentKind::Claude => ResolvedAgent::Claude,
         AgentKind::Interpreter => ResolvedAgent::Interpreter,
+        AgentKind::OpenClaw => ResolvedAgent::OpenClaw,
         AgentKind::Junie => ResolvedAgent::Junie,
         AgentKind::Pi => ResolvedAgent::Pi,
         AgentKind::Dsh => ResolvedAgent::Dsh,
@@ -277,7 +282,12 @@ pub fn resolve_launch(agent: AgentKind, command: &[String]) -> Result<LaunchSpec
     if !expected_binary.is_empty() {
         let first = command.first().and_then(|s| Path::new(s).file_name());
         let first_name = first.and_then(|s| s.to_str());
-        if !is_agent_binary(resolved, first_name) {
+        // An explicit absolute executable can be a supervised native adapter.
+        // Prepending `codex` here recurses through a PATH-installed desktop shim.
+        let explicit_executable = command
+            .first()
+            .is_some_and(|value| Path::new(value).is_absolute());
+        if !is_agent_binary(resolved, first_name) && !explicit_executable {
             command.insert(0, expected_binary.to_string());
         }
     }
@@ -292,6 +302,7 @@ fn default_agent_binary(agent: ResolvedAgent) -> &'static str {
         ResolvedAgent::Codex => "codex",
         ResolvedAgent::Claude => "claude",
         ResolvedAgent::Interpreter => "interpreter",
+        ResolvedAgent::OpenClaw => "openclaw",
         ResolvedAgent::Junie => "junie",
         ResolvedAgent::Pi => "pi",
         ResolvedAgent::Dsh => "dsh",
@@ -307,6 +318,7 @@ fn is_agent_binary(agent: ResolvedAgent, binary: Option<&str>) -> bool {
         (ResolvedAgent::Codex, Some("codex"))
             | (ResolvedAgent::Claude, Some("claude" | "claude-code"))
             | (ResolvedAgent::Interpreter, Some("interpreter" | "i"))
+            | (ResolvedAgent::OpenClaw, Some("openclaw"))
             | (ResolvedAgent::Junie, Some("junie"))
             | (ResolvedAgent::Pi, Some("pi"))
             | (ResolvedAgent::Dsh, Some("dsh"))
@@ -320,6 +332,7 @@ pub fn default_command(agent: ResolvedAgent) -> Result<Vec<String>> {
         ResolvedAgent::Codex => Ok(vec!["codex".to_string()]),
         ResolvedAgent::Claude => Ok(vec!["claude".to_string()]),
         ResolvedAgent::Interpreter => Ok(vec!["interpreter".to_string()]),
+        ResolvedAgent::OpenClaw => Ok(vec!["openclaw".to_string()]),
         ResolvedAgent::Junie => Ok(vec!["junie".to_string()]),
         ResolvedAgent::Pi => Ok(vec!["pi".to_string()]),
         ResolvedAgent::Dsh => Ok(vec!["dsh".to_string()]),
@@ -327,7 +340,7 @@ pub fn default_command(agent: ResolvedAgent) -> Result<Vec<String>> {
         ResolvedAgent::Copilot => Ok(vec!["copilot".to_string()]),
         ResolvedAgent::Generic => {
             anyhow::bail!(
-                "ai-fence-cli run requires --agent codex/claude/interpreter/junie/pi/dsh/kimi/copilot or a command after --"
+                "ai-fence-cli run requires --agent codex/claude/interpreter/openclaw/junie/pi/dsh/kimi/copilot or a command after --"
             )
         }
     }
@@ -340,6 +353,7 @@ pub fn detect_agent(command: &[String]) -> Option<ResolvedAgent> {
         "codex" => Some(ResolvedAgent::Codex),
         "claude" | "claude-code" => Some(ResolvedAgent::Claude),
         "interpreter" | "i" => Some(ResolvedAgent::Interpreter),
+        "openclaw" => Some(ResolvedAgent::OpenClaw),
         "junie" => Some(ResolvedAgent::Junie),
         "pi" => Some(ResolvedAgent::Pi),
         "dsh" => Some(ResolvedAgent::Dsh),
@@ -487,6 +501,7 @@ pub fn resolve_agent_profile(
         ResolvedAgent::Codex => "codex",
         ResolvedAgent::Claude => "claude",
         ResolvedAgent::Interpreter => "interpreter",
+        ResolvedAgent::OpenClaw => "openclaw",
         ResolvedAgent::Junie => "junie",
         ResolvedAgent::Pi => "pi",
         ResolvedAgent::Dsh => "dsh",
@@ -494,7 +509,7 @@ pub fn resolve_agent_profile(
         ResolvedAgent::Copilot => "copilot",
         ResolvedAgent::Generic => {
             anyhow::bail!(
-                "managed agent profiles are only supported for Codex, Claude Code, Open Interpreter, Junie, pi, dsh, kimi, and copilot"
+                "managed agent profiles are only supported for Codex, Claude Code, Open Interpreter, OpenClaw, Junie, pi, dsh, kimi, and copilot"
             )
         }
     };
@@ -808,6 +823,9 @@ fn should_sync_agent_state_entry(agent: ResolvedAgent, name: &str) -> bool {
         ResolvedAgent::Interpreter => {
             matches!(name, "history.jsonl" | "sessions" | "shell_snapshots")
         }
+        // The generated OpenClaw session.store lives under this directory.
+        // Keep its native session artifacts, never agent auth or models.json.
+        ResolvedAgent::OpenClaw => matches!(name, "sessions"),
         ResolvedAgent::Generic => false,
     }
 }
@@ -1179,6 +1197,22 @@ pub fn write_codex_config_with_profile_and_default_model(
 
 /// Write a managed Codex configuration using an explicit/default model
 /// selection and optional profile, MCP, and ordered model-catalog extras.
+/// Pin a launched Codex process to its owning proxy even if another launch
+/// rewrites the shared profile's config.toml. Place these global options before
+/// the native subcommand/argument separator; do not persist them as profile state.
+pub fn codex_runtime_provider_args(proxy_base: &str) -> Vec<String> {
+    let endpoint = format!("{}/v1", proxy_base.trim_end_matches('/'));
+    vec![
+        "-c".to_string(),
+        "model_provider=\"ai_fence\"".to_string(),
+        "-c".to_string(),
+        format!(
+            "model_providers.ai_fence.base_url={}",
+            toml::Value::String(endpoint)
+        ),
+    ]
+}
+
 pub fn write_codex_config_with_model_selection(
     codex_home: &Path,
     proxy_base: &str,
@@ -2687,6 +2721,22 @@ pub struct CopilotProviderConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_codex_runtime_executable_is_not_replaced_by_path_shim() {
+        let command = vec![
+            "/trusted/adapter/bin/codex-runtime".into(),
+            "app-server".into(),
+        ];
+        let launch = resolve_launch(AgentKind::Codex, &command).unwrap();
+        assert_eq!(launch.command, command);
+        assert_eq!(
+            resolve_launch(AgentKind::Codex, &["exec".into()])
+                .unwrap()
+                .command,
+            vec!["codex", "exec"]
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -3229,6 +3279,40 @@ mod tests {
             "http://127.0.0.1:1234/v1/chat/completions"
         );
         assert_eq!(completions["apiType"], "OpenAICompletion");
+    }
+
+    #[test]
+    fn codex_runtime_endpoint_survives_a_later_shared_profile_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("shared-codex-home");
+        let first = "http://127.0.0.1:31001";
+        let second = "http://127.0.0.1:31002";
+        write_codex_config(&home, first, None, None, false, CodexProviderAuth::EnvKey)
+            .expect("first profile write");
+        let first_args = codex_runtime_provider_args(first);
+        write_codex_config(&home, second, None, None, false, CodexProviderAuth::EnvKey)
+            .expect("second profile write");
+        let shared: toml::Value = fs::read_to_string(home.join("config.toml"))
+            .expect("shared profile")
+            .parse()
+            .expect("profile TOML");
+        assert_eq!(
+            shared["model_providers"]["ai_fence"]["base_url"].as_str(),
+            Some("http://127.0.0.1:31002/v1")
+        );
+        let first_override: toml::Value = first_args[3].parse().expect("runtime override TOML");
+        assert_eq!(
+            first_override["model_providers"]["ai_fence"]["base_url"].as_str(),
+            Some("http://127.0.0.1:31001/v1")
+        );
+        let second_args = codex_runtime_provider_args(second);
+        let second_override: toml::Value = second_args[3]
+            .parse()
+            .expect("second runtime override TOML");
+        assert_eq!(
+            second_override["model_providers"]["ai_fence"]["base_url"],
+            shared["model_providers"]["ai_fence"]["base_url"]
+        );
     }
 
     #[test]
@@ -4129,7 +4213,11 @@ custom_user_setting = "keep"
         let user_catalog_path = user_catalog.to_string_lossy().to_string();
         fs::write(
             template_dir.join("config.toml"),
-            format!("model_catalog_json = \"{user_catalog_path}\"\n"),
+            toml::to_string(&std::collections::BTreeMap::from([(
+                "model_catalog_json",
+                user_catalog_path.clone(),
+            )]))
+            .expect("serialize template catalog path"),
         )
         .expect("write template");
 

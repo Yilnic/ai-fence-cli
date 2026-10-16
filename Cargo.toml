@@ -2,6 +2,7 @@
 members = [
     "crates/ai-fence-cli-core",
     "crates/ai-fence-contract",
+    "crates/ai-fence-client",
     "crates/ai-fence-model-metadata",
 ]
 resolver = "2"

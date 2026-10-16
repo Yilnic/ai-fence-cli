@@ -2125,10 +2125,10 @@ mod tests {
     fn saved_oidc_credentials_are_private() {
         let scope = TestCredentialsScope::new();
         scope.write_credentials("private-access-token");
-        let path = crate::auth::credentials_path().expect("credentials path");
 
         #[cfg(unix)]
         {
+            let path = crate::auth::credentials_path().expect("credentials path");
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(path)
                 .expect("credentials metadata")
@@ -2727,6 +2727,62 @@ mod tests {
         assert_eq!(body["usage"]["input_tokens"], 10);
         assert_eq!(body["usage"]["output_tokens"], 2);
         server.join().expect("mock upstream should complete");
+    }
+
+    #[actix_web::test]
+    async fn deterministic_local_validation_error_is_forwarded_without_retry_or_capacity_reclassification(
+    ) {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = hits.clone();
+        let error = serde_json::json!({"error":{"type":"invalid_request_error",
+            "code":"ai_fence_local_validation_error", "message":"missing tool output identity",
+            "stage":"request_canonicalization", "origin":"ai_fence", "upstream_called":false, "retryable":false}});
+        let response_error = error.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let server = actix_web::HttpServer::new(move || {
+            let count = count.clone();
+            let error = response_error.clone();
+            App::new().default_service(web::to(move || {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let error = error.clone();
+                async move { actix_web::HttpResponse::BadRequest().json(error) }
+            }))
+        })
+        .workers(1)
+        .listen(listener)
+        .unwrap()
+        .run();
+        let handle = server.handle();
+        actix_web::rt::spawn(server);
+        let state = web::Data::new(ProxyState {
+            fence_url: upstream,
+            auth_method: AuthMethod::MasterKey("fixture".into()),
+            correlation_headers: Vec::new(),
+            local_api_key: None,
+            subscription_mode: false,
+            provider_auth_env_var: None,
+            protocol_diffs_dir: None,
+            observe_request_duration: |_| {},
+        });
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(state)
+                .default_service(web::to(proxy_handler)),
+        )
+        .await;
+        for (index, stream) in [false, true].into_iter().enumerate() {
+            let request = actix_web::test::TestRequest::post()
+                .uri("/v1/responses")
+                .set_json(serde_json::json!({"model":"fixture", "input":[], "stream":stream}))
+                .to_request();
+            let response = actix_web::test::call_service(&app, request).await;
+            assert_eq!(response.status(), ActixStatus::BAD_REQUEST);
+            let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+            assert_eq!(body, error);
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), index + 1);
+        }
+        handle.stop(true).await;
     }
 
     #[actix_web::test]

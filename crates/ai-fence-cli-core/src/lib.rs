@@ -2,7 +2,12 @@ pub mod agent_launcher;
 pub mod auth;
 pub mod config;
 pub mod open_interpreter;
+pub mod openclaw;
 pub mod proxy;
+pub mod workspace_snapshot;
+
+/// Bundled desktop adapter, installer and lifecycle helper (no private engine).
+pub const CODEX_DESKTOP_RUNTIME: &str = include_str!("../assets/codex_desktop.py");
 
 #[cfg(test)]
 mod boundary_tests {
@@ -16,7 +21,14 @@ mod boundary_tests {
             include_str!("auth.rs"),
             include_str!("config.rs"),
             include_str!("open_interpreter.rs"),
+            include_str!("openclaw.rs"),
             include_str!("proxy.rs"),
+            include_str!("workspace_snapshot.rs"),
+            include_str!("workspace_snapshot/command.rs"),
+            include_str!("workspace_snapshot/discovery.rs"),
+            include_str!("workspace_snapshot/sets.rs"),
+            include_str!("bin/ai-fence-snapshot.rs"),
+            include_str!("../assets/codex_desktop.py"),
         ];
         for source in sources {
             for private_path in [
