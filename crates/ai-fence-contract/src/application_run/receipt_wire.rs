@@ -9,14 +9,11 @@ enum Counter {
     Number(u64),
     Decimal(String),
 }
+#[derive(Default)]
 enum Member<T> {
+    #[default]
     Absent,
     Present(Option<T>),
-}
-impl<T> Default for Member<T> {
-    fn default() -> Self {
-        Self::Absent
-    }
 }
 impl<T> Member<T> {
     fn absent(&self) -> bool {

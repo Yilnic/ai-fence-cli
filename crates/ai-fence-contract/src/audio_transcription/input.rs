@@ -133,11 +133,7 @@ impl PreparedAudio {
                     }
                     format = Some((bytes[..16].to_vec(), rate, align));
                 }
-                b"data" => {
-                    if audio.replace(bytes).is_some() {
-                        return Err(bad);
-                    }
-                }
+                b"data" if audio.replace(bytes).is_some() => return Err(bad),
                 _ => {}
             }
             position = end.checked_add(length % 2).ok_or(bad)?;

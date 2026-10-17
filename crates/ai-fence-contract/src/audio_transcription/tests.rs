@@ -230,3 +230,31 @@ fn prepared_wave_hashes_canonical_audio_and_binds_measured_source() {
     };
     assert!(PreparedAudio::prepare(&source, &short).is_err());
 }
+
+#[test]
+fn wave_data_chunk_is_recorded_before_format_and_duplicates_are_rejected() {
+    let limits = AudioLimits {
+        max_input_bytes: MAX_AUDIO_BYTES,
+        max_input_duration_ms: MAX_INPUT_DURATION_MS,
+    };
+    let source = wav_fixture();
+    let mut data_first = source[..12].to_vec();
+    data_first.extend_from_slice(&source[36..]);
+    data_first.extend_from_slice(&source[12..36]);
+    let prepared = PreparedAudio::prepare(&data_first, &limits).unwrap();
+    assert_eq!(prepared.as_bytes(), source);
+    assert_eq!(prepared.duration_ms(), 2000);
+
+    let mut empty_data = b"data".to_vec();
+    empty_data.extend_from_slice(&0u32.to_le_bytes());
+    for extra in [source[36..].to_vec(), empty_data] {
+        let mut duplicate = source.clone();
+        duplicate.extend_from_slice(&extra);
+        let length = duplicate.len() as u32 - 8;
+        duplicate[4..8].copy_from_slice(&length.to_le_bytes());
+        assert!(matches!(
+            PreparedAudio::prepare(&duplicate, &limits),
+            Err(TranscriptionError::InvalidAudio)
+        ));
+    }
+}
