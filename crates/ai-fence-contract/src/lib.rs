@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 
 pub mod application;
 pub mod application_cancellation;
+pub mod application_native;
 pub mod application_run;
+pub mod audio_transcription;
+pub mod document_input;
 pub mod subscription;
 
 #[cfg(test)]

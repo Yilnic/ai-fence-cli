@@ -1,9 +1,11 @@
-//! Bounded structured-text attempts. This contract alone enables no execution.
+//! Bounded structured-text and explicitly negotiated native attempts.
+//! This contract alone enables no execution.
 //!
 //! Dispatch keys identify one paid attempt, not a promise of result replay.
 //! Registry metadata contains neither input nor result; callers persist a received
 //! result locally. Use [`parse_request`] at an untrusted JSON boundary.
 use crate::application::{BindingIdentity, SCHEMA_VERSION};
+use crate::application_native::NativeTurnInput;
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -63,6 +65,129 @@ impl fmt::Debug for StructuredTextInput {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputKind {
+    #[default]
+    StructuredText,
+    NativeFunctions,
+    AudioTranscription,
+    StructuredDocument,
+}
+impl InputKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::StructuredText => "structured_text",
+            Self::NativeFunctions => "native_functions",
+            Self::AudioTranscription => "audio_transcription",
+            Self::StructuredDocument => "structured_document",
+        }
+    }
+    pub fn is_structured(&self) -> bool {
+        *self == Self::StructuredText
+    }
+}
+
+/// The structured variant preserves the original v1 object and digest exactly.
+/// Native input additionally requires explicit root mode/receipt negotiation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RunInput {
+    Structured(StructuredTextInput),
+    Native(NativeTurnInput),
+    Audio(crate::audio_transcription::TranscriptionInput),
+    Document(crate::document_input::DocumentInput),
+}
+impl From<StructuredTextInput> for RunInput {
+    fn from(input: StructuredTextInput) -> Self {
+        Self::Structured(input)
+    }
+}
+impl From<NativeTurnInput> for RunInput {
+    fn from(input: NativeTurnInput) -> Self {
+        Self::Native(input)
+    }
+}
+impl From<crate::audio_transcription::TranscriptionInput> for RunInput {
+    fn from(input: crate::audio_transcription::TranscriptionInput) -> Self {
+        Self::Audio(input)
+    }
+}
+impl From<crate::document_input::DocumentInput> for RunInput {
+    fn from(input: crate::document_input::DocumentInput) -> Self {
+        Self::Document(input)
+    }
+}
+impl RunInput {
+    pub fn kind(&self) -> InputKind {
+        match self {
+            Self::Structured(_) => InputKind::StructuredText,
+            Self::Native(_) => InputKind::NativeFunctions,
+            Self::Audio(_) => InputKind::AudioTranscription,
+            Self::Document(_) => InputKind::StructuredDocument,
+        }
+    }
+    pub fn max_output_tokens(&self) -> u32 {
+        match self {
+            Self::Structured(input) => input.max_output_tokens,
+            Self::Native(input) => input.max_output_tokens,
+            Self::Audio(_) => 0,
+            Self::Document(input) => input.output.max_output_tokens,
+        }
+    }
+    pub fn as_structured(&self) -> Option<&StructuredTextInput> {
+        if let Self::Structured(input) = self {
+            Some(input)
+        } else {
+            None
+        }
+    }
+    pub fn as_structured_mut(&mut self) -> Option<&mut StructuredTextInput> {
+        if let Self::Structured(input) = self {
+            Some(input)
+        } else {
+            None
+        }
+    }
+    pub fn as_document(&self) -> Option<&crate::document_input::DocumentInput> {
+        if let Self::Document(input) = self {
+            Some(input)
+        } else {
+            None
+        }
+    }
+    pub fn as_audio(&self) -> Option<&crate::audio_transcription::TranscriptionInput> {
+        if let Self::Audio(input) = self {
+            Some(input)
+        } else {
+            None
+        }
+    }
+    pub fn as_native(&self) -> Option<&NativeTurnInput> {
+        if let Self::Native(input) = self {
+            Some(input)
+        } else {
+            None
+        }
+    }
+}
+
+fn non_null_selector<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+fn valid_selectors(kind: Option<InputKind>, receipt: Option<u32>) -> bool {
+    matches!(
+        (kind, receipt),
+        (None, None | Some(2))
+            | (Some(InputKind::NativeFunctions), Some(2))
+            | (Some(InputKind::AudioTranscription), Some(3))
+            | (Some(InputKind::StructuredDocument), Some(2))
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitRunRequest {
@@ -77,7 +202,19 @@ pub struct SubmitRunRequest {
     pub payload_digest: String,
     pub funding: Funding,
     pub retention: Retention,
-    pub input: StructuredTextInput,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "non_null_selector"
+    )]
+    pub input_kind: Option<InputKind>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "non_null_selector"
+    )]
+    pub receipt_version: Option<u32>,
+    pub input: RunInput,
 }
 
 pub fn canonical_uuid(value: &str) -> bool {
@@ -115,6 +252,24 @@ fn revision(value: u64) -> bool {
     value > 0 && value <= i64::MAX as u64
 }
 
+impl StructuredTextInput {
+    pub(crate) fn validate(&self) -> Result<(), ValidationError> {
+        if !role(&self.schema_name) || self.prompt.is_empty() || !self.json_schema.is_object() {
+            return Err(ValidationError::InvalidRequest);
+        }
+        if self.instructions.len() > MAX_INSTRUCTIONS_BYTES
+            || self.prompt.len() > MAX_PROMPT_BYTES
+            || serde_json::to_vec(&self.json_schema)
+                .map_err(|_| ValidationError::InvalidRequest)?
+                .len()
+                > MAX_SCHEMA_BYTES
+        {
+            return Err(ValidationError::TooLarge);
+        }
+        Ok(())
+    }
+}
+
 impl SubmitRunRequest {
     fn validate_fields(&self) -> Result<(), ValidationError> {
         if self.schema_version != SCHEMA_VERSION
@@ -125,23 +280,25 @@ impl SubmitRunRequest {
             || !canonical_uuid(&self.operation_id)
             || !canonical_uuid(&self.dispatch_key)
             || !(1..=3).contains(&self.attempt_number)
-            || !role(&self.input.schema_name)
-            || self.input.prompt.is_empty()
-            || !self.input.json_schema.is_object()
-            || self.input.max_output_tokens == 0
+            || !valid_selectors(self.input_kind, self.receipt_version)
+            || self.input_kind.unwrap_or_default() != self.input.kind()
+            || (self.input.kind() != InputKind::AudioTranscription
+                && self.input.max_output_tokens() == 0)
         {
             return Err(ValidationError::InvalidRequest);
         }
-        if self.input.instructions.len() > MAX_INSTRUCTIONS_BYTES
-            || self.input.prompt.len() > MAX_PROMPT_BYTES
-            || serde_json::to_vec(&self.input.json_schema)
-                .map_err(|_| ValidationError::InvalidRequest)?
-                .len()
-                > MAX_SCHEMA_BYTES
-            || serde_json::to_vec(self)
-                .map_err(|_| ValidationError::InvalidRequest)?
-                .len()
-                > MAX_REQUEST_BYTES
+        match &self.input {
+            RunInput::Native(input) => input.validate()?,
+            RunInput::Audio(input) => input
+                .validate()
+                .map_err(|_| ValidationError::InvalidRequest)?,
+            RunInput::Structured(input) => input.validate()?,
+            RunInput::Document(input) => input.validate()?,
+        }
+        if serde_json::to_vec(self)
+            .map_err(|_| ValidationError::InvalidRequest)?
+            .len()
+            > MAX_REQUEST_BYTES
         {
             return Err(ValidationError::TooLarge);
         }
@@ -194,7 +351,7 @@ fn canonical_bytes(value: &Value) -> Result<Vec<u8>, ValidationError> {
 
 /// Reject duplicate keys at *every* depth, including the private JSON schema.
 /// Generic serde_json::Value parsing otherwise silently chooses the last key.
-struct UniqueJson(Value);
+pub(crate) struct UniqueJson(pub(crate) Value);
 impl<'de> Deserialize<'de> for UniqueJson {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct Visitor;
@@ -310,8 +467,7 @@ pub enum PriceState {
     Settled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReceipt {
     pub schema_version: u32,
     pub run_id: String,
@@ -325,15 +481,29 @@ pub struct RunReceipt {
     pub policy_revision: u64,
     pub selected_model: String,
     pub usage_state: UsageState,
+    pub input_audio_ms: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub settlement_state: Option<SettlementState>,
     pub price_state: PriceState,
     /// Nonnegative bounded decimal USD string. Unknown is null, never zero.
     pub usd_amount: Option<String>,
     pub price_snapshot_ref: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementState {
+    HeldUnknown,
+    Settled,
+    ReconciliationRequired,
+}
+
+mod receipt_wire;
 impl RunReceipt {
     pub fn validate(&self) -> Result<(), ValidationError> {
         let counts = [
@@ -341,8 +511,10 @@ impl RunReceipt {
             self.output_tokens,
             self.cached_input_tokens,
             self.reasoning_tokens,
+            self.total_tokens,
+            self.cache_write_tokens,
         ];
-        if self.schema_version != SCHEMA_VERSION
+        if !matches!(self.schema_version, 1..=3)
             || !canonical_uuid(&self.run_id)
             || !canonical_uuid(&self.attempt_id)
             || !canonical_uuid(&self.provider_call_id)
@@ -352,15 +524,63 @@ impl RunReceipt {
             || !revision(self.policy_revision)
             || !identifier(&self.profile_id)
             || !identifier(&self.selected_model)
-            || (self.usage_state == UsageState::Unknown && counts.iter().any(Option::is_some))
-            || (self.usage_state == UsageState::Reported && counts.iter().all(Option::is_none))
+            || (self.schema_version != 3 && self.input_audio_ms.is_some())
+            || (self.schema_version == 3
+                && (counts.iter().any(Option::is_some) || self.input_audio_ms == Some(0)))
+            || (self.usage_state == UsageState::Unknown
+                && (counts.iter().any(Option::is_some) || self.input_audio_ms.is_some()))
+            || (self.usage_state == UsageState::Reported
+                && counts.iter().all(Option::is_none)
+                && self.input_audio_ms.is_none())
             || (self.price_state == PriceState::Unknown
                 && (self.usd_amount.is_some() || self.price_snapshot_ref.is_some()))
             || (self.price_state != PriceState::Unknown
-                && (!self.usd_amount.as_deref().is_some_and(decimal_usd)
-                    || !self.price_snapshot_ref.as_deref().is_some_and(identifier)))
+                && (!self.usd_amount.as_deref().is_some_and(|amount| {
+                    if self.schema_version == 1 {
+                        decimal_usd(amount)
+                    } else {
+                        receipt_wire::finite_decimal_usd(amount)
+                    }
+                }) || !self.price_snapshot_ref.as_deref().is_some_and(identifier)))
         {
             return Err(ValidationError::InvalidResponse);
+        }
+        if self.schema_version == 1 {
+            if self.total_tokens.is_some()
+                || self.cache_write_tokens.is_some()
+                || self.settlement_state.is_some()
+            {
+                return Err(ValidationError::InvalidResponse);
+            }
+        } else {
+            if self.settlement_state.is_none()
+                || (self.settlement_state == Some(SettlementState::Settled)
+                    && self.price_state == PriceState::Unknown)
+                || (self.price_state != PriceState::Unknown
+                    && self.usage_state != UsageState::Reported)
+            {
+                return Err(ValidationError::InvalidResponse);
+            }
+            if self.schema_version == 2 && self.usage_state == UsageState::Reported {
+                let (Some(input), Some(output), Some(total)) =
+                    (self.input_tokens, self.output_tokens, self.total_tokens)
+                else {
+                    return Err(ValidationError::InvalidResponse);
+                };
+                if input.checked_add(output) != Some(total)
+                    || self.cached_input_tokens.is_some_and(|n| n > input)
+                    || self.cache_write_tokens.is_some_and(|n| n > input)
+                    || self
+                        .cached_input_tokens
+                        .zip(self.cache_write_tokens)
+                        .is_some_and(|(read, write)| {
+                            u128::from(read) + u128::from(write) > u128::from(input)
+                        })
+                    || self.reasoning_tokens.is_some_and(|n| n > output)
+                {
+                    return Err(ValidationError::InvalidResponse);
+                }
+            }
         }
         Ok(())
     }
@@ -399,6 +619,18 @@ pub struct RunResponse {
     pub profile_id: String,
     pub profile_revision: u64,
     pub policy_revision: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "non_null_selector"
+    )]
+    pub input_kind: Option<InputKind>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "non_null_selector"
+    )]
+    pub receipt_version: Option<u32>,
     pub status: RunStatus,
     pub reason: Option<RunReason>,
     pub receipt: Option<RunReceipt>,
@@ -411,7 +643,7 @@ pub struct RunResponse {
     pub result: Option<Value>,
 }
 fn present_json<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
-    Value::deserialize(deserializer).map(Some)
+    UniqueJson::deserialize(deserializer).map(|value| Some(value.0))
 }
 impl fmt::Debug for RunResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -428,6 +660,7 @@ impl RunResponse {
     /// `allow_inline` is true ONLY for the authoritative submit response, never GET.
     pub fn validate(&self, allow_inline: bool) -> Result<(), ValidationError> {
         if self.schema_version != SCHEMA_VERSION
+            || !valid_selectors(self.input_kind, self.receipt_version)
             || !valid_binding(&self.binding)
             || !canonical_uuid(&self.run_id)
             || !canonical_uuid(&self.attempt_id)
@@ -445,7 +678,8 @@ impl RunResponse {
         }
         if let Some(receipt) = &self.receipt {
             receipt.validate()?;
-            if receipt.run_id != self.run_id
+            if receipt.schema_version != self.receipt_version.unwrap_or(1)
+                || receipt.run_id != self.run_id
                 || receipt.attempt_id != self.attempt_id
                 || receipt.binding != self.binding
                 || receipt.binding_revision != self.binding_revision
@@ -503,6 +737,8 @@ impl RunResponse {
 
     pub fn matches_request(&self, request: &SubmitRunRequest) -> bool {
         self.binding_revision == request.binding_revision
+            && self.input_kind == request.input_kind
+            && self.receipt_version == request.receipt_version
             && self.operation_id == request.operation_id
             && self.attempt_number == request.attempt_number
             && self.dispatch_key == request.dispatch_key

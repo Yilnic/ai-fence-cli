@@ -6,6 +6,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const BINDING_READINESS_V1: &str = "application_binding_readiness_v1";
 pub const APPLICATION_RUNS_V1: &str = "application_runs_v1";
 pub const METADATA_ONLY_V1: &str = "metadata_only_retention_v1";
+pub const FULL_RUN_RECEIPTS_V2: &str = "full_run_receipts_v2";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -279,17 +280,66 @@ impl ApplicationCapabilities {
     pub fn supports_workload(&self, role: &str, required: &[&str]) -> bool {
         self.schema_version == SCHEMA_VERSION
             && self.enabled
-            && self
-                .enforced_capabilities
-                .iter()
-                .any(|value| value == APPLICATION_RUNS_V1)
             && self.workloads.get(role).is_some_and(|workload| {
+                let has_global = |capability| {
+                    self.enforced_capabilities
+                        .iter()
+                        .any(|value| value == capability)
+                };
+                let has_role = |capability| {
+                    workload
+                        .enforced_capabilities
+                        .iter()
+                        .any(|value| value == capability)
+                };
+                let native = has_role(crate::application_native::NATIVE_FUNCTION_TURNS_V1);
+                let audio = has_role(crate::audio_transcription::AUDIO_TRANSCRIPTION_RUNS_V1);
+                let document = has_role(crate::document_input::STRUCTURED_DOCUMENT_INPUT_V1);
+                let protocol_ready = if document {
+                    !native
+                        && !audio
+                        && !has_role(APPLICATION_RUNS_V1)
+                        && has_global(crate::document_input::STRUCTURED_DOCUMENT_INPUT_V1)
+                        && has_role(FULL_RUN_RECEIPTS_V2)
+                } else if audio {
+                    !native
+                        && !has_role(APPLICATION_RUNS_V1)
+                        && has_global(crate::audio_transcription::AUDIO_TRANSCRIPTION_RUNS_V1)
+                        && has_role(crate::audio_transcription::DURATION_RUN_RECEIPTS_V3)
+                } else if native {
+                    has_global(crate::application_native::NATIVE_FUNCTION_TURNS_V1)
+                        && has_role(FULL_RUN_RECEIPTS_V2)
+                } else {
+                    has_global(APPLICATION_RUNS_V1) || has_role(APPLICATION_RUNS_V1)
+                };
                 workload.ready
+                    && protocol_ready
                     && workload.reason.is_none()
                     && workload
                         .profile_revision
                         .is_some_and(|revision| revision > 0)
                     && required.iter().all(|capability| {
+                        if *capability == APPLICATION_RUNS_V1 {
+                            return !native
+                                && !audio
+                                && !document
+                                && (has_global(APPLICATION_RUNS_V1)
+                                    || has_role(APPLICATION_RUNS_V1));
+                        }
+                        if *capability == crate::application_native::NATIVE_FUNCTION_TURNS_V1 {
+                            return native && protocol_ready;
+                        }
+                        if *capability == crate::document_input::STRUCTURED_DOCUMENT_INPUT_V1 {
+                            return document && protocol_ready;
+                        }
+                        if *capability == FULL_RUN_RECEIPTS_V2 {
+                            return !audio && has_role(FULL_RUN_RECEIPTS_V2);
+                        }
+                        if *capability == crate::audio_transcription::AUDIO_TRANSCRIPTION_RUNS_V1
+                            || *capability == crate::audio_transcription::DURATION_RUN_RECEIPTS_V3
+                        {
+                            return audio && protocol_ready;
+                        }
                         self.enforced_capabilities
                             .iter()
                             .chain(&workload.enforced_capabilities)
@@ -374,6 +424,118 @@ mod tests {
         assert!(!capabilities.matches(&descriptor));
         capabilities.enabled = false;
         assert!(!capabilities.supports_workload("review", &[METADATA_ONLY_V1]));
+    }
+
+    #[test]
+    fn mixed_native_and_text_roles_cannot_inherit_each_others_protocol_capability() {
+        use crate::application_native::NATIVE_FUNCTION_TURNS_V1;
+        let mut caps = ApplicationCapabilities {
+            schema_version: 1,
+            binding: BindingIdentity {
+                binding_id: "binding".into(),
+                application_id: "application".into(),
+                stage_id: "stage".into(),
+                service_name: "ai".into(),
+            },
+            binding_revision: 1,
+            enabled: true,
+            enforced_capabilities: vec![
+                NATIVE_FUNCTION_TURNS_V1.into(),
+                METADATA_ONLY_V1.into(),
+                FULL_RUN_RECEIPTS_V2.into(),
+            ],
+            workloads: BTreeMap::from([
+                (
+                    "native".into(),
+                    WorkloadReadiness {
+                        profile_id: "native-profile".into(),
+                        profile_revision: Some(1),
+                        ready: true,
+                        reason: None,
+                        enforced_capabilities: vec![
+                            NATIVE_FUNCTION_TURNS_V1.into(),
+                            FULL_RUN_RECEIPTS_V2.into(),
+                        ],
+                    },
+                ),
+                (
+                    "text".into(),
+                    WorkloadReadiness {
+                        profile_id: "text-profile".into(),
+                        profile_revision: Some(1),
+                        ready: true,
+                        reason: None,
+                        enforced_capabilities: vec![
+                            APPLICATION_RUNS_V1.into(),
+                            FULL_RUN_RECEIPTS_V2.into(),
+                        ],
+                    },
+                ),
+            ]),
+        };
+        assert!(caps.supports_workload(
+            "native",
+            &[
+                NATIVE_FUNCTION_TURNS_V1,
+                FULL_RUN_RECEIPTS_V2,
+                METADATA_ONLY_V1
+            ]
+        ));
+        assert!(caps.supports_workload("text", &[APPLICATION_RUNS_V1, METADATA_ONLY_V1]));
+        assert!(!caps.supports_workload("native", &[APPLICATION_RUNS_V1]));
+        assert!(!caps.supports_workload("text", &[NATIVE_FUNCTION_TURNS_V1]));
+        // Even an accidentally broad global claim cannot authorize the wrong
+        // protocol on a native role in the new SDK.
+        caps.enforced_capabilities.push(APPLICATION_RUNS_V1.into());
+        assert!(!caps.supports_workload("native", &[APPLICATION_RUNS_V1]));
+        caps.workloads
+            .get_mut("native")
+            .unwrap()
+            .enforced_capabilities
+            .retain(|cap| cap != FULL_RUN_RECEIPTS_V2);
+        assert!(!caps.supports_workload("native", &[NATIVE_FUNCTION_TURNS_V1]));
+    }
+
+    #[test]
+    fn document_readiness_is_role_scoped_v2_and_refuses_hybrid_protocol_claims() {
+        use crate::document_input::STRUCTURED_DOCUMENT_INPUT_V1 as DOC;
+        let mut caps: ApplicationCapabilities = serde_json::from_value(json!({
+            "schema_version":1,"binding":{"binding_id":"fixture","application_id":"app","stage_id":"stage","service_name":"ai"},
+            "binding_revision":1,"enabled":true,"enforced_capabilities":[DOC,METADATA_ONLY_V1,FULL_RUN_RECEIPTS_V2],
+            "workloads":{
+                "doc":{"profile_id":"document","profile_revision":1,"ready":true,"reason":null,"enforced_capabilities":[DOC,METADATA_ONLY_V1,FULL_RUN_RECEIPTS_V2]},
+                "text":{"profile_id":"text","profile_revision":1,"ready":true,"reason":null,"enforced_capabilities":[APPLICATION_RUNS_V1,FULL_RUN_RECEIPTS_V2]}
+            }
+        })).unwrap();
+        assert!(caps.supports_workload("doc", &[DOC, FULL_RUN_RECEIPTS_V2, METADATA_ONLY_V1]));
+        assert!(caps.supports_workload("text", &[APPLICATION_RUNS_V1]));
+        assert!(!caps.supports_workload("text", &[DOC]));
+        caps.enforced_capabilities.push(APPLICATION_RUNS_V1.into());
+        assert!(!caps.supports_workload("doc", &[APPLICATION_RUNS_V1]));
+        for extra in [
+            APPLICATION_RUNS_V1,
+            crate::application_native::NATIVE_FUNCTION_TURNS_V1,
+            crate::audio_transcription::AUDIO_TRANSCRIPTION_RUNS_V1,
+        ] {
+            let mut bad = caps.clone();
+            bad.workloads
+                .get_mut("doc")
+                .unwrap()
+                .enforced_capabilities
+                .push(extra.into());
+            assert!(!bad.supports_workload("doc", &[DOC]));
+        }
+        for cap in [DOC, FULL_RUN_RECEIPTS_V2] {
+            let mut bad = caps.clone();
+            bad.workloads
+                .get_mut("doc")
+                .unwrap()
+                .enforced_capabilities
+                .retain(|v| v != cap);
+            assert!(!bad.supports_workload("doc", &[DOC]));
+        }
+        caps.enforced_capabilities.retain(|v| v != DOC);
+        assert!(!caps.supports_workload("doc", &[DOC]));
     }
 
     #[test]

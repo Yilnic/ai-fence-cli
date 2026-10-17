@@ -1,6 +1,11 @@
 use super::*;
 use serde_json::json;
 
+#[path = "v2_tests.rs"]
+mod v2;
+#[path = "v3_tests.rs"]
+mod v3;
+
 fn request() -> SubmitRunRequest {
     let mut request = SubmitRunRequest {
         schema_version: 1,
@@ -14,13 +19,15 @@ fn request() -> SubmitRunRequest {
         payload_digest: String::new(),
         funding: Funding::ApplicationApi,
         retention: Retention::MetadataOnly,
+        input_kind: None,
+        receipt_version: None,
         input: StructuredTextInput {
             instructions: "Teach with evidence".into(),
             prompt: "Private question: 学习?".into(),
             schema_name: "practice".into(),
             json_schema: json!({"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}),
             max_output_tokens: 512,
-        },
+        }.into(),
     };
     request.payload_digest = request.canonical_digest().unwrap();
     request
@@ -34,6 +41,7 @@ fn response() -> RunResponse {
         service_name: "ai".into(),
     };
     let receipt = RunReceipt {
+        input_audio_ms: None,
         schema_version: 1,
         run_id: "66666666-6666-4666-8666-666666666666".into(),
         attempt_id: "77777777-7777-4777-8777-777777777777".into(),
@@ -49,6 +57,9 @@ fn response() -> RunResponse {
         output_tokens: None,
         cached_input_tokens: None,
         reasoning_tokens: None,
+        total_tokens: None,
+        cache_write_tokens: None,
+        settlement_state: None,
         price_state: PriceState::Unknown,
         usd_amount: None,
         price_snapshot_ref: None,
@@ -67,6 +78,8 @@ fn response() -> RunResponse {
         profile_id: request.profile_id.clone(),
         profile_revision: 3,
         policy_revision: 4,
+        input_kind: None,
+        receipt_version: None,
         status: RunStatus::Completed,
         reason: None,
         receipt: Some(receipt),
@@ -110,7 +123,7 @@ fn canonical_digest_has_a_stable_cross_language_vector_and_excludes_only_key_and
         );
     }
     let mut changed = original.clone();
-    changed.input.prompt.push('!');
+    changed.input.as_structured_mut().unwrap().prompt.push('!');
     assert_ne!(changed.canonical_digest().unwrap(), original.payload_digest);
     assert_eq!(changed.validate(), Err(ValidationError::DigestMismatch));
 }
@@ -148,13 +161,20 @@ fn untrusted_json_rejects_duplicate_unknown_trailing_and_oversized_private_field
         Err(ValidationError::TooLarge)
     );
     let mut oversized = request.clone();
-    oversized.input.prompt = "密".repeat(MAX_PROMPT_BYTES / 3 + 1);
+    oversized.input.as_structured_mut().unwrap().prompt = "密".repeat(MAX_PROMPT_BYTES / 3 + 1);
     assert_eq!(oversized.canonical_digest(), Err(ValidationError::TooLarge));
-    oversized.input.prompt = "ok".into();
-    oversized.input.instructions = "a".repeat(MAX_INSTRUCTIONS_BYTES + 1);
+    oversized.input.as_structured_mut().unwrap().prompt = "ok".into();
+    oversized.input.as_structured_mut().unwrap().instructions =
+        "a".repeat(MAX_INSTRUCTIONS_BYTES + 1);
     assert_eq!(oversized.canonical_digest(), Err(ValidationError::TooLarge));
-    oversized.input.instructions.clear();
-    oversized.input.json_schema = json!({"description":"x".repeat(MAX_SCHEMA_BYTES)});
+    oversized
+        .input
+        .as_structured_mut()
+        .unwrap()
+        .instructions
+        .clear();
+    oversized.input.as_structured_mut().unwrap().json_schema =
+        json!({"description":"x".repeat(MAX_SCHEMA_BYTES)});
     assert_eq!(oversized.canonical_digest(), Err(ValidationError::TooLarge));
     assert!(!format!("{request:?}").contains("Private question"));
     assert!(!ValidationError::InvalidRequest
@@ -265,3 +285,6 @@ fn result_delivery_distinguishes_authoritative_inline_from_lost_content_without_
     assert_eq!(decoded.result, Some(Value::Null));
     decoded.validate(true).unwrap();
 }
+
+#[path = "document_tests.rs"]
+mod documents;

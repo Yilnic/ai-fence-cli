@@ -12,6 +12,11 @@ use std::{
     thread,
 };
 
+#[path = "audio_tests.rs"]
+mod audio;
+#[path = "v2_tests.rs"]
+mod v2;
+
 fn fixture(origin: &str) -> ManagedConnection {
     ManagedConnection {
         schema_version: 1,
@@ -53,13 +58,16 @@ fn request() -> SubmitRunRequest {
         payload_digest: String::new(),
         funding: Funding::ApplicationApi,
         retention: Retention::MetadataOnly,
+        input_kind: None,
+        receipt_version: None,
         input: StructuredTextInput {
             instructions: "private instructions".into(),
             prompt: "private learner prompt".into(),
             schema_name: "practice".into(),
             json_schema: json!({"type":"object"}),
             max_output_tokens: 50,
-        },
+        }
+        .into(),
     };
     request.payload_digest = request.canonical_digest().unwrap();
     request
@@ -67,6 +75,7 @@ fn request() -> SubmitRunRequest {
 fn completed(connection: &ManagedConnection) -> RunResponse {
     let request = request();
     let receipt = RunReceipt {
+        input_audio_ms: None,
         schema_version: 1,
         run_id: "66666666-6666-4666-8666-666666666666".into(),
         attempt_id: "77777777-7777-4777-8777-777777777777".into(),
@@ -82,6 +91,9 @@ fn completed(connection: &ManagedConnection) -> RunResponse {
         output_tokens: None,
         cached_input_tokens: None,
         reasoning_tokens: None,
+        total_tokens: None,
+        cache_write_tokens: None,
+        settlement_state: None,
         price_state: PriceState::Unknown,
         usd_amount: None,
         price_snapshot_ref: None,
@@ -100,6 +112,8 @@ fn completed(connection: &ManagedConnection) -> RunResponse {
         profile_id: request.profile_id,
         profile_revision: 3,
         policy_revision: 4,
+        input_kind: None,
+        receipt_version: None,
         status: RunStatus::Completed,
         reason: None,
         receipt: Some(receipt),
@@ -526,7 +540,7 @@ async fn malformed_requests_and_expired_credentials_are_rejected_before_network(
     let connection = fixture("http://127.0.0.1:1");
     let client = ApplicationClient::new(&connection.fence_url, Duration::from_secs(1)).unwrap();
     let mut changed = request();
-    changed.input.prompt.push('!');
+    changed.input.as_structured_mut().unwrap().prompt.push('!');
     assert_eq!(
         client
             .submit_run(&connection, &credential(&fixture(&origin)), &changed)
@@ -572,3 +586,9 @@ async fn malformed_requests_and_expired_credentials_are_rejected_before_network(
         Error::InvalidConfiguration
     );
 }
+
+#[path = "v1_recovery_tests.rs"]
+mod v1_recovery;
+
+#[path = "document_tests.rs"]
+mod documents;

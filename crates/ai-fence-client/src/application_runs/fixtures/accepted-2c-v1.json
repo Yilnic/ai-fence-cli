@@ -1,0 +1,129 @@
+{
+  "metadata": {
+    "attempt_id": "77777777-7777-4777-8777-777777777777",
+    "attempt_number": 1,
+    "binding": {
+      "application_id": "44444444-4444-4444-8444-444444444444",
+      "binding_id": "33333333-3333-4333-8333-333333333333",
+      "service_name": "ai",
+      "stage_id": "55555555-5555-4555-8555-555555555555"
+    },
+    "binding_revision": 2,
+    "dispatch_key": "22222222-2222-4222-8222-222222222222",
+    "operation_id": "11111111-1111-4111-8111-111111111111",
+    "payload_digest": "eec47834d291d9517dc811aaca3b2e0b41e882853a90a144a9b51a470437bec4",
+    "policy_revision": 4,
+    "profile_id": "practice",
+    "profile_revision": 3,
+    "reason": null,
+    "receipt": {
+      "attempt_id": "77777777-7777-4777-8777-777777777777",
+      "binding": {
+        "application_id": "44444444-4444-4444-8444-444444444444",
+        "binding_id": "33333333-3333-4333-8333-333333333333",
+        "service_name": "ai",
+        "stage_id": "55555555-5555-4555-8555-555555555555"
+      },
+      "binding_revision": 2,
+      "cached_input_tokens": 5,
+      "input_tokens": 30,
+      "output_tokens": 10,
+      "policy_revision": 4,
+      "price_snapshot_ref": "frozen-2c-price",
+      "price_state": "estimated",
+      "profile_id": "practice",
+      "profile_revision": 3,
+      "provider_call_id": "88888888-8888-4888-8888-888888888888",
+      "reasoning_tokens": null,
+      "run_id": "66666666-6666-4666-8666-666666666666",
+      "schema_version": 1,
+      "selected_model": "frozen-fixture-model",
+      "usage_state": "reported",
+      "usd_amount": "0.0001"
+    },
+    "result_delivery": "not_retained",
+    "run_id": "66666666-6666-4666-8666-666666666666",
+    "schema_version": 1,
+    "status": "completed",
+    "workload_role": "learning_practice_text"
+  },
+  "request": {
+    "attempt_number": 1,
+    "binding_revision": 2,
+    "dispatch_key": "22222222-2222-4222-8222-222222222222",
+    "funding": "application_api",
+    "input": {
+      "instructions": "FICTIONAL_SAVED_V1_INSTRUCTIONS",
+      "json_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      },
+      "max_output_tokens": 64,
+      "prompt": "FICTIONAL_SAVED_V1_PROMPT",
+      "schema_name": "practice"
+    },
+    "operation_id": "11111111-1111-4111-8111-111111111111",
+    "payload_digest": "eec47834d291d9517dc811aaca3b2e0b41e882853a90a144a9b51a470437bec4",
+    "profile_id": "practice",
+    "profile_revision": 3,
+    "retention": "metadata_only",
+    "schema_version": 1,
+    "workload_role": "learning_practice_text"
+  },
+  "unknown_metadata": {
+    "attempt_id": "77777777-7777-4777-8777-777777777777",
+    "attempt_number": 1,
+    "binding": {
+      "application_id": "44444444-4444-4444-8444-444444444444",
+      "binding_id": "33333333-3333-4333-8333-333333333333",
+      "service_name": "ai",
+      "stage_id": "55555555-5555-4555-8555-555555555555"
+    },
+    "binding_revision": 2,
+    "dispatch_key": "22222222-2222-4222-8222-222222222222",
+    "operation_id": "11111111-1111-4111-8111-111111111111",
+    "payload_digest": "eec47834d291d9517dc811aaca3b2e0b41e882853a90a144a9b51a470437bec4",
+    "policy_revision": 4,
+    "profile_id": "practice",
+    "profile_revision": 3,
+    "reason": null,
+    "receipt": {
+      "attempt_id": "77777777-7777-4777-8777-777777777777",
+      "binding": {
+        "application_id": "44444444-4444-4444-8444-444444444444",
+        "binding_id": "33333333-3333-4333-8333-333333333333",
+        "service_name": "ai",
+        "stage_id": "55555555-5555-4555-8555-555555555555"
+      },
+      "binding_revision": 2,
+      "cached_input_tokens": null,
+      "input_tokens": null,
+      "output_tokens": null,
+      "policy_revision": 4,
+      "price_snapshot_ref": null,
+      "price_state": "unknown",
+      "profile_id": "practice",
+      "profile_revision": 3,
+      "provider_call_id": "88888888-8888-4888-8888-888888888888",
+      "reasoning_tokens": null,
+      "run_id": "66666666-6666-4666-8666-666666666666",
+      "schema_version": 1,
+      "selected_model": "frozen-fixture-model",
+      "usage_state": "unknown",
+      "usd_amount": null
+    },
+    "result_delivery": "not_retained",
+    "run_id": "66666666-6666-4666-8666-666666666666",
+    "schema_version": 1,
+    "status": "completed",
+    "workload_role": "learning_practice_text"
+  }
+}
