@@ -265,7 +265,14 @@ fn nested_fenced_style_exec_borrows_the_same_process_owned_lease() {
 #[test]
 fn shell_function_can_cd_in_parent_shell_then_use_existing_aliases() {
     let fixture = Fixture::new();
-    let script = fixture.command().arg("shell-init").output().unwrap();
+    // This fixture executes Bash, regardless of the runner's parent shell.
+    // PowerShell module paths can also be inherited by Bash processes.
+    let script = fixture
+        .command()
+        .args(["shell-init", "--shell", "bash"])
+        .env("PSModulePath", "synthetic-inherited-powershell-modules")
+        .output()
+        .unwrap();
     assert!(script.status.success());
     let script = format!("{}\nfws alpha\npwd\nshopt -s expand_aliases\nalias existing_agent='printf alias-preserved'\nexisting_agent\n", String::from_utf8(script.stdout).unwrap());
     let output = Command::new("bash")
