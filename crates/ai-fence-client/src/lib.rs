@@ -13,6 +13,7 @@ use std::{
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 mod application_cancellations;
+mod application_offers;
 mod application_revocations;
 mod application_runs;
 

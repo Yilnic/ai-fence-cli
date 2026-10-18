@@ -10,6 +10,7 @@ pub mod application_run;
 pub mod audio_transcription;
 pub mod document_input;
 pub mod subscription;
+pub mod workload_offer;
 
 #[cfg(test)]
 mod usage_tests;

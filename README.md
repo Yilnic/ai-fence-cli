@@ -195,3 +195,16 @@ version dependent and must be verified before switching a running connection.
 
 See [Codex desktop and WSL setup](CODEX_DESKTOP_WSL.md) for installation, state
 selection, checkpoints, workspaces, diagnostics and rollback commands.
+
+### Workload processing disclosure
+
+The workload-offer extension adds a machine-authenticated, revision-pinned
+`ApplicationClient::workload_offer` read for the exact configured role. Its typed
+result contains the actual downstream origin/model, operator-configured policy,
+modality limits and complete frozen pricing, without provider credentials or
+source content. `application_workload_offer_v1` is a per-role capability, not a
+run or funding grant. Both existing capabilities and saved run wires remain
+compatible. Applications must freeze reviewed consent metadata and independently
+recheck consent and admission before any send; disclosure never replays a run or
+starts inference. New consumers require a reviewed immutable SDK handoff before
+adopting this extension; runtime rollout is a separate gate.
