@@ -41,7 +41,8 @@ pub enum ResolvedAgent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum CodexAuthSource {
-    /// Copy existing ~/.codex/auth.json only when managed auth is missing.
+    /// Bootstrap auth only when missing; this does not synchronize native re-login.
+    /// Desktop shared auth uses one native credential owner instead.
     #[default]
     Auto,
     /// Use auth already present in the managed CODEX_HOME.

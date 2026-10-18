@@ -18,10 +18,10 @@ import unittest
 
 
 class Client:
-    def __init__(self, shim, environment):
+    def __init__(self, shim, environment, cwd=None):
         self.process = subprocess.Popen([str(shim), "app-server"], env=environment,
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE)
+                                        stderr=subprocess.PIPE, cwd=cwd)
         self.messages = queue.Queue()
         self.stderr = []
         def read():
@@ -71,6 +71,7 @@ class Client:
                 raise AssertionError("non-JSON text on app-server stdout")
             if value.get("id") == identifier:
                 if "error" in value:
+                    self.last_error = value["error"]
                     raise AssertionError(f"native RPC rejected {method}; code={value['error'].get('code')}")
                 return value["result"]
         raise AssertionError("bounded native RPC timeout")
@@ -116,7 +117,7 @@ class NativeIntegration(unittest.TestCase):
             cli = str(Path(os.environ["AF_TEST_CLI"]).resolve())
             install = root / "adapter"
             setup = [cli, "codex-desktop", "--install-root", str(install), "setup", "--native-codex",
-                     str(Path(os.environ["AF_TEST_NATIVE"]).resolve()), "--state-home", str(state), "--profile", "fixture-native", "--snapshots", "off"]
+                     str(Path(os.environ["AF_TEST_NATIVE"]).resolve()), "--state-home", str(state), "--auth-home", str(state), "--updates", "off", "--profile", "fixture-native", "--snapshots", "off"]
             subprocess.run(setup, env=environment, capture_output=True, timeout=20, check=True)
             before = (install / "settings.json").read_bytes()
             subprocess.run(setup, env=environment, capture_output=True, timeout=20, check=True)

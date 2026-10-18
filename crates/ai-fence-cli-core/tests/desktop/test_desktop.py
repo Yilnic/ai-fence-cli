@@ -110,33 +110,21 @@ class DesktopTests(unittest.TestCase):
         with patch.dict(os.environ, {"AI_FENCE_SNAPSHOTS":"off"}), patch.object(desktop.subprocess, "run", side_effect=AssertionError("must not probe")):
             self.assertIsNone(desktop.checkpoint(self.settings, "/does-not-exist", "thread_off"))
 
-    def test_cleanup_is_bounded_preview_and_protects_chat_linked_dirty_workspaces(self):
-        for index in range(3):
-            desktop.attach(self.settings, f"thread_{index}", self.project, self.lease)
-        (self.project / "untracked").write_text("keep")
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            desktop.workspace_control(self.settings, SimpleNamespace(workspace_action="cleanup", limit=2))
-        report = json.loads(output.getvalue())
-        self.assertTrue(report["preview"])
-        self.assertTrue(report["truncated"])
-        self.assertTrue(all(v["protected"] == "chat-linked" for v in report["workspaces"]))
-        self.assertEqual((self.project / "untracked").read_text(), "keep")
+    def test_explicit_desktop_checkpoint_policy_reaches_helper_without_ambient_override(self):
+        self.settings.update(snapshot_policy="auto", roots=[str(self.project)], snapshot_directory=str(self.root / "store"))
+        with patch.dict(os.environ):
+            os.environ.pop("AI_FENCE_SNAPSHOTS", None)
+            with patch.object(desktop.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=b'{"id":"af-fixture","path":"/fixture"}')) as run:
+                desktop.checkpoint(self.settings, self.project, "thread-explicit-policy")
+            self.assertEqual(run.call_args_list[0].kwargs["env"].get("AI_FENCE_SNAPSHOTS"), "auto")
 
-    def test_adoption_preview_does_not_touch_native_history_or_records(self):
-        (self.home / "native.sqlite").write_bytes(b"untouched")
-        args = SimpleNamespace(workspace_action="adopt", thread_id="old_thread", project=self.project, workspace=None, apply=False)
-        with patch.object(desktop, "native_thread", return_value=dict(cwd=str(self.project))), contextlib.redirect_stdout(io.StringIO()):
-            desktop.workspace_control(self.settings, args)
-        self.assertFalse(desktop.record_path(self.settings, "old_thread").exists())
-        self.assertEqual((self.home / "native.sqlite").read_bytes(), b"untouched")
-
-    def test_external_git_metadata_not_advertised_as_isolated(self):
-        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
-        self.assertTrue(desktop.git_independent(self.project))
-        alternate = self.project / ".git/objects/info/alternates"
-        alternate.write_text("/external/objects\n")
-        self.assertFalse(desktop.git_independent(self.project))
+    def test_workspace_control_delegates_arguments_and_preserves_native_state(self):
+        (self.home / "auth.json").write_text("fixture unchanged")
+        args = SimpleNamespace(arguments=["run", "feature-a", "--", "codex-fenced", "--yolo"])
+        with patch.object(desktop.subprocess, "call", return_value=7) as run:
+            self.assertEqual(desktop.workspace_control(self.settings, args), 7)
+        self.assertEqual(run.call_args.args[0][1:], ["workspace", *args.arguments])
+        self.assertEqual((self.home / "auth.json").read_text(), "fixture unchanged")
 
     def native(self):
         native = self.root / "native-codex"
@@ -148,7 +136,7 @@ class DesktopTests(unittest.TestCase):
         native = native or self.native()
         cli = cli or native
         args = SimpleNamespace(install_root=self.root / "install", native_codex=native,
-                               state_home=self.home, seed_home=None, profile="fixture", snapshots="off",
+                               state_home=self.home, seed_home=None, auth_home=self.home, updates="off", profile="fixture", snapshots="off",
                                approve_root=[], snapshot_directory=None, readiness_seconds=0)
         # A separate fake payload keeps the native/runtime recursion guard meaningful.
         if cli == native:
@@ -237,25 +225,6 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual((self.home / "auth.json").read_text(), "fixture-managed-refresh")
         self.assertFalse((self.home / "auth.json").is_symlink())
 
-    def test_previewed_isolated_workspace_reused_and_missing_workspace_needs_recovery(self):
-        workspace = self.root / "workspaces/thread_isolated"
-        workspace.mkdir(parents=True)
-        (workspace / "dirty").write_text("keep uncommitted work")
-        record = desktop.attach(self.settings, "thread_isolated", workspace, self.lease, mode="isolated")
-        record["project"] = desktop.identity(self.project)
-        record["leases"] = []
-        desktop.save(desktop.record_path(self.settings, "thread_isolated"), record)
-        self.settings["roots"] = [str(self.project)]
-        args = SimpleNamespace(workspace_action="create", thread_id="thread_isolated", project=self.project,
-                               directory=self.root / "workspaces", apply=True)
-        with patch.object(desktop, "native_thread", return_value=dict(cwd=str(self.project))), contextlib.redirect_stdout(io.StringIO()):
-            desktop.workspace_control(self.settings, args)
-        self.assertEqual((workspace / "dirty").read_text(), "keep uncommitted work")
-        (workspace / "dirty").unlink()
-        workspace.rmdir()
-        with patch.object(desktop, "native_thread", return_value=dict(cwd=str(self.project))), self.assertRaisesRegex(RuntimeError, "missing"):
-            desktop.workspace_control(self.settings, args)
-
     def test_lifecycle_reserves_resume_lease_before_forwarding(self):
         record = desktop.attach(self.settings, "thread_reserve", self.project, self.lease)
         record["leases"] = []
@@ -280,6 +249,75 @@ class DesktopTests(unittest.TestCase):
             desktop.control(["--install-root", str(args.install_root), "rollback"])
         self.assertEqual(desktop.load(args.install_root / "settings.json")["release"], settings["release"])
         self.assertTrue((args.install_root / "releases" / updated["release"]).exists())
+        self.assertEqual(desktop.load(args.install_root / "settings.json")["update_policy"], "manual")
+
+    def test_prepared_update_only_adds_immutable_files_until_atomic_activation(self):
+        settings, args = self.install()
+        original = (args.install_root / "settings.json").read_bytes()
+        old_payload = desktop.cli_payload(settings).read_bytes()
+        args.prepare_only = self.root / "prepared"
+        cli = self.root / "fence-cli"
+        cli.write_text("#!/bin/sh\n# fixture upgrade\nexit 0\n")
+        with patch.dict(os.environ, {"AI_FENCE_DESKTOP_CLI_SOURCE":str(cli)}), contextlib.redirect_stdout(io.StringIO()):
+            desktop.install(args)
+        prepared = desktop.load(args.prepare_only / "settings.json")
+        self.assertNotEqual(prepared["release"], settings["release"])
+        self.assertEqual((args.install_root / "settings.json").read_bytes(), original)
+        desktop.updates.activate(args.install_root, settings, args.prepare_only)
+        self.assertEqual(desktop.load(args.install_root / "settings.json")["release"], prepared["release"])
+        self.assertEqual(desktop.cli_payload(settings).read_bytes(), old_payload)
+
+    def test_discovery_router_parses_global_variants_and_retains_admission_on_both_routes(self):
+        settings, args = self.install()
+        prefix = self.root / "admission"
+        record = self.root / "dispatch-record.json"
+        prefix.write_text("#!/usr/bin/env python3\nimport json,os,sys\nopen(" + repr(str(record)) + ",'w').write(json.dumps({'argv':sys.argv[1:],'mcp':os.getenv('FIXTURE_MCP_ENV')}))\n")
+        prefix.chmod(0o700)
+        router = self.root / "router"
+        router.write_text(desktop.discovery_router(settings, [str(prefix), "--"]))
+        router.chmod(0o700)
+        for arguments in [["app-server"], ["-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled"],
+                          ["--config=model=\"fixture\"", "--enable", "fixture-feature", "app-server"]]:
+            subprocess.run([str(router), *arguments], env={**os.environ,"FIXTURE_MCP_ENV":"preserved"}, check=True)
+            result = json.loads(record.read_text())
+            self.assertEqual(result["argv"], ["--", str(args.install_root / "bin/codex"), *arguments])
+            self.assertEqual(result["mcp"], "preserved")
+        arguments = ["resume", "fixture-id", "--all"]
+        subprocess.run([str(router), *arguments], check=True)
+        self.assertEqual(json.loads(record.read_text())["argv"], ["--", settings["native_codex"], *arguments])
+
+    def test_update_preparation_does_not_recreate_missing_state_home(self):
+        settings, args = self.install()
+        self.home.rename(self.root / "original-state")
+        args.prepare_only = self.root / "prepared"
+        with patch.dict(os.environ, {"AI_FENCE_DESKTOP_CLI_SOURCE":str(self.root / "fence-cli")}), self.assertRaisesRegex(RuntimeError, "missing"):
+            desktop.install(args)
+        self.assertFalse(self.home.exists())
+
+    def test_setup_preserves_existing_admission_prefix_during_preparation(self):
+        settings, args = self.install()
+        admission = self.root / "admission"
+        admission.write_text("#!/bin/sh\n[ \"$1\" != -- ] || shift\nexec \"$@\"\n")
+        admission.chmod(0o700)
+        args.launch_prefix = [str(admission), "--"]
+        with patch.dict(os.environ, {"AI_FENCE_DESKTOP_CLI_SOURCE":str(self.root / "fence-cli")}), contextlib.redirect_stdout(io.StringIO()):
+            desktop.install(args)
+        settings = desktop.load(args.install_root / "settings.json")
+        self.assertEqual(settings["launch_prefix"], [str(admission), "--"])
+        self.assertIn(str(admission), (args.install_root / "bin/codex").read_text())
+        args.launch_prefix = None
+        args.prepare_only = self.root / "prepared"
+        with patch.dict(os.environ, {"AI_FENCE_DESKTOP_CLI_SOURCE":str(self.root / "fence-cli")}), contextlib.redirect_stdout(io.StringIO()):
+            desktop.install(args)
+        self.assertEqual(desktop.load(args.prepare_only / "settings.json")["launch_prefix"], settings["launch_prefix"])
+
+    def test_workspace_child_launch_prefix_flag_is_forwarded_without_interception(self):
+        settings, args = self.install()
+        child = ["run", "alpha", "--", "fixture-command", "--launch-prefix", "literal", "--"]
+        with patch.object(desktop, "workspace_control", return_value=23) as run:
+            status = desktop.control(["--install-root", str(args.install_root), "workspace", *child])
+        self.assertEqual(status, 23)
+        self.assertEqual(run.call_args.args[1].arguments, child)
 
     def test_doctor_sanitizes_metadata_and_identifies_dead_explicit_endpoint(self):
         settings, args = self.install()

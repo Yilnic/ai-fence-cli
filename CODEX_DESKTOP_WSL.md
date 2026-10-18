@@ -1,5 +1,8 @@
 # Codex desktop and native WSL setup
 
+The named workspace interface below starts with v0.1.8; v0.1.7 retains
+its original workspace commands and checkpoint defaults.
+
 This opt-in target is bundled in `ai-fence-cli`; it requires Linux/WSL and
 Python 3.11+. Install the CLI normally, then run the target below. It preserves
 the genuine native executable and explicitly selects a durable Codex state
@@ -10,6 +13,7 @@ proxy. Native Windows connections remain available.
 ai-fence-cli codex-desktop --install-root "$HOME/.local/share/ai-fence-codex-desktop" setup \
   --native-codex /absolute/path/to/genuine/codex \
   --state-home /absolute/path/to/chosen/codex/state \
+  --auth-home "${CODEX_HOME:-$HOME/.codex}" \
   --profile personal
 ```
 
@@ -18,8 +22,10 @@ Choose the existing store containing the conversations you want to resume.
 AI Fence stores usually live under
 `$AI_FENCE_HOME/profiles/PROFILE/codex/state`; the native default is `~/.codex`.
 Setup requires an explicit store so it cannot silently start a fresh history.
-The same adapter handles CLI and desktop entry points with that store. Its
-profile default is `AI_FENCE_CODEX_PROFILE`, then `AI_FENCE_PROFILE`, then
+Profile-auth installations support CLI and desktop entry points with that store.
+Shared native authentication is currently for the desktop stdio app-server;
+ordinary native CLI launches keep their native home. The profile default is
+`AI_FENCE_CODEX_PROFILE`, then `AI_FENCE_PROFILE`, then
 `default`; selecting a profile never merges stores or accounts.
 
 The native path is resolved to its physical executable. AI Fence never renames
@@ -31,21 +37,115 @@ are content-addressed and retained for rollback. Repeating identical setup is
 idempotent. The payload includes the CLI, adapter, runtime helper, snapshot
 command dispatcher and a Windows session launcher; Python is a prerequisite.
 
-Authentication stays native. Existing managed auth always wins. If seeding a
-new managed store is necessary, explicitly add `--seed-home /same/account/home`.
-It copies an absent `auth.json` under a lock; it never links credentials or
-replaces an existing bundle. Native Codex owns refresh and atomic auth updates.
-Alternatively run `INSTALL_ROOT/bin/codex login` against the chosen store.
+Authentication stays native, with one explicit credential owner. A fresh setup
+uses the native `CODEX_HOME` (normally `~/.codex`) for credentials while
+`--state-home` retains the existing conversations. Specify `--auth-home` once
+to make the selection explicit; upgrades retain the installed selection. To keep
+an independent account in the history profile, select that same path for both
+options. An upgrade of an older installation retains profile auth until you
+explicitly select the native owner.
+
+In shared-native mode, a small auth-only native app-server owns browser/device
+login, logout and OAuth refresh in `--auth-home`. The history app-server uses
+Codex's supported external-token login/refresh API with ephemeral storage.
+Only access tokens are supplied in memory; refresh tokens are never copied to
+the history home. A stale/revoked profile file is preserved and ignored by this
+process. Desktop re-login and `INSTALL_ROOT/bin/codex login` target the same
+credential owner. Account mismatches fail before binding; a later native login
+to another account cannot silently change this history profile's account.
+
+This mode requires native file credential storage and the external-token API;
+setup checks the installed schema. Keyring/auto stores, API keys and native TUI
+through this adapter use profile auth instead. Generic `run --codex-auth-source
+auto` still means bootstrap-if-missing, not credential synchronization. It does
+not repair another profile's login. No SQLite stores or histories are merged.
 Config is preserved: provider, Responses transport and owning loopback endpoint
 are process overrides. Desktop launches do not write ephemeral routes into the
 shared `config.toml`. Concurrent profiles can use separate install roots/stores;
 concurrent launches of one installation receive independent proxies.
+
+The native subscription WebSocket route currently rejects `response.steer`
+locally because its upstream steering capability is not established. Updating a
+proxy alone does not enable that route. Queued next-turn input and app-server
+`turn/steer` acceptance are separate from upstream mid-response steering. See
+[the steering API](https://developers.openai.com/api/docs/guides/steering) for the
+OpenAI API contract; it does not establish support at every subscription endpoint.
+
+## Automatic proxy updates
+
+New official installations default to `--updates auto`. On a future stdio
+app-server launch, the adapter checks the trusted HTTPS release manifest at most
+once per day. Network/download failures back off five minutes and retain the
+working release. Checks and downloads have bounded timeouts; concurrent launches
+use one update lock and other launches proceed with the current release.
+There is no background timer or recurring monitoring.
+Launch updates currently support Linux x86_64; other architectures report
+`unsupported_target` without downloading or executing an incompatible binary.
+
+An update verifies target, version, size, SHA-256 and executable version, then
+asks the new official CLI to prepare its immutable release. It verifies unchanged
+history/auth/profile/checkpoint policy and router files before one atomic settings
+switch. Concurrent settings changes cancel activation, including changes that
+retain the same release. Old payloads remain available to active processes and rollback. Updating
+never restarts a chat, desktop, proxy, WSL, or memory admission service. A running
+connection adopts new code only after its normal reconnect; a newer download alone
+does not change an executable already mapped into a process.
+
+```bash
+ai-fence-cli codex-desktop --install-root /absolute/install/root update --check-only
+ai-fence-cli codex-desktop --install-root /absolute/install/root update
+ai-fence-cli codex-desktop --install-root /absolute/install/root doctor --check-auth
+```
+
+`doctor` distinguishes installed CLI version/hash from each running launch's
+version/hash and reports pending older processes, auth home and last update status.
+`--check-auth` additionally makes one read-only authenticated provider models
+request; TCP connectivity and history reads alone do not prove valid model auth.
+No credentials or provider response bodies appear in diagnostics.
+
+Use setup `--updates manual` or `--updates off` to disable launch checks; manual
+`update` remains explicit. A rollback sets updates to manual so the next launch
+cannot immediately undo it. Re-enable auto through setup when ready. Native Codex
+upgrades and changes to discovery/admission wrappers require explicit setup;
+auto-update will preserve modified or changed routers instead of overwriting them.
+Checksums identify release bytes; they are not a publisher signature.
+
+If the host already uses a memory/admission broker, supply its existing command
+prefix once during setup, LAST: `--launch-prefix /absolute/existing/launcher --`.
+The installer retains that prefix on upgrades and applies it before loading the
+adapter or checking for updates. Automatic activation refuses an admission-policy
+change. No broker, cap or nesting rule is installed or changed by this option.
+
+These mechanisms apply to the official installation. Existing custom pinned
+payloads do not gain automatic updates merely by updating the normal CLI. Migrate
+them through a reviewed setup when their running sessions are ready; preserve any
+outer memory/admission launcher. Publishing a CLI release does not migrate or
+activate a replacement for those custom installations.
 
 ## Connect the Windows desktop
 
 Use the installed `INSTALL_ROOT/bin/codex` for the WSL connection. Discovery is
 version dependent: setup deliberately does not edit Windows configuration,
 change default CLI aliases, or download a native CLI over the adapter.
+
+For desktop builds that discover the default `codex` command, generate an
+optional router for review. It parses the native command after global options,
+routes all `app-server` invocations to this installation, and preserves ordinary
+native CLI arguments and environment. It does not depend on one exact desktop
+feature flag, flag order or installed app version:
+
+```bash
+ai-fence-cli codex-desktop --install-root /absolute/install/root discovery-router > codex-router.py
+# With an existing memory/admission launcher, preserve it on BOTH routes:
+ai-fence-cli codex-desktop --install-root /absolute/install/root discovery-router \
+  --launch-prefix /absolute/existing/admission-launcher -- > codex-router.py
+```
+
+Generation does not replace your current command or activate a connection. Install
+it only through the existing host's reviewed wrapper/update mechanism. Keep the
+native Windows connection available. Direct/network app-server transports remain
+unsupported by the desktop adapter and fail explicitly rather than selecting a
+fresh native history store.
 
 Export the packaged launcher for the Windows maintenance chat to inspect:
 
@@ -81,10 +181,41 @@ an available Linux filesystem and configure `--readiness-seconds` (0–120,
 default 45). It passively waits for the configured native executable and exact
 state filesystem identity and never creates a replacement state home at launch.
 
-## Checkpoints and persistent workspaces
+## Named workspaces and optional checkpoints
 
-Default mode keeps the original cwd and takes **read-only checkpoints** of an
-explicitly approved current project. Add policy during setup:
+We recommend **Btrfs writable workspaces** for independent parallel agents.
+Use the same named registry for CLI and desktop; see [the workspace guide](WORKSPACES.md)
+for filesystem setup, `fws` shell convenience, manual `cd`, review and removal.
+
+```bash
+ai-fence-cli ws create feature-a --from /absolute/project/subvolume
+ai-fence-cli ws run feature-a -- codex-fenced --yolo
+ai-fence-cli ws path feature-a
+```
+
+Open that path as a WSL project in the desktop. The adapter reserves the actual
+thread workspace before forwarding work and links native start/resume/fork
+responses. CLI launches from inside the directory use the same lease automatically.
+A new proxy, temporary run ID or process startup directory does not choose a
+new workspace. Ordinary resume reuses the current files and saved subdirectory.
+Missing/replaced workspaces require explicit recovery, never silent fallback.
+
+The registry defaults to `~/.ai-fence/workspace-registry`, independently of
+provider/account/history stores. If CLI tools use `AI_FENCE_WORKSPACE_HOME`,
+select that same registry during desktop setup with `--workspace-registry PATH`.
+Workspace selection does not change `CODEX_HOME`. To share conversations,
+select the same existing native state store in both entry points; separate
+profiles/stores are not merged or linked through workspace names.
+
+Setup initializes `fw` (Fence workspace) and `fws` (Fence workspace switch).
+Use `fw create feature-a`, `fws feature-a`, or `fw run feature-a -- codex-fenced --yolo`.
+It is not required: ordinary `cd` plus
+existing fenced aliases works, including from workspace subdirectories.
+The desktop `codex-desktop workspace` entry forwards to the same management
+engine as `ai-fence-cli workspace` rather than keeping another clone implementation.
+
+Read-only checkpoints preserve recovery points and keep cwd unchanged.
+They default to **off** in this build. Explicitly add policy during setup:
 
 ```bash
 ai-fence-cli codex-desktop --install-root /absolute/install/root setup \
@@ -93,82 +224,44 @@ ai-fence-cli codex-desktop --install-root /absolute/install/root setup \
   --snapshot-directory /absolute/same-btrfs/checkpoints
 ```
 
-Repeat `--approve-root` for additional exact roots. Ordinary directories and
-unsupported filesystems produce an unavailable outcome. A `required` checkpoint
-failure closes the owning stdio connection before its thread response is
-forwarded; this strict mode can affect other threads on that same connection. `off`
-disables checkpoint creation without disabling Fence. Native app-server thread
-start/resume/fork responses and `thread/started` notifications drive registration,
-including multiple chats in a long-lived server. Startup IDs never choose the
-chat's workspace. Each registered checkpoint is pinned against ordinary prune.
-Nested checkpoints are sequential manifest sets; pause writers for consistency.
-Changed retained blocks consume space. Checkpoints are not independent backups.
+An inherited `AI_FENCE_SNAPSHOTS=auto` or `required` still overrides the configured
+policy. Use `AI_FENCE_SNAPSHOTS=off` for a session-only opt-out. Exact approved
+roots remain required; named workspace creation does not silently add roots to
+an existing checkpoint allowlist. `required` failure closes the owning stdio
+connection before forwarding its thread response, which can affect other threads
+on that connection. Nested checkpoints are sequential sets; pause writers for
+consistency. Conversation and filesystem references are not automatically the
+same point in time.
 
-The installed `ai-fence-snapshot` dispatcher exposes status, inspect, create,
-list, pin and prune through the bundled CLI. `AI_FENCE_SNAPSHOT_MIN_FREE_BYTES`
-controls the free-space floor. Prune defaults to preview, caps each invocation at 32 sets (`--limit`), and protects pinned,
-incomplete, recent and newest sets. Use `ai-fence-snapshot --help` to inspect checkpoint commands and options.
-Workspace cleanup is a bounded metadata preview and preserves all chat-linked,
-active, dirty, pinned and unowned workspaces. Old runtime releases are retained;
-this version does not automatically delete releases or writable workspaces.
+The snapshot dispatcher exposes status, inspect, create, list, pin and prune.
+Prune previews by default and caps each invocation at 32 sets (`--limit`).
+It protects pinned/incomplete/recent/newest sets. There is no automatic deletion
+or total-retention cap. Desktop chat-referenced read-only checkpoints are pinned.
+Writable workspaces have their own guarded `workspace rm` preview and explicit
+application, described in the workspace guide. Existing workspaces/releases are
+retained when connections close.
 
-Writable isolation is explicit and persistent, one workspace per thread:
+Interactive native CLI pickers do not expose thread IDs to their parent.
+Their selected native store is recorded to protect workspace removal without
+inventing identities. The desktop can register such a thread using native metadata
+when it is opened. `resume --all`, explicit native session IDs and directory
+flags remain agent arguments. Known registered IDs require their saved workspace
+for CLI resume; use `fws NAME` first. Provider/account/cwd filters remain separate.
 
-```bash
-ai-fence-cli codex-desktop --install-root /absolute/install/root workspace create \
-  --thread-id THREAD_ID --project /approved/project --directory /same-btrfs/workspaces
-# Inspect the preview, then repeat with --apply.
-```
-
-Creation copies the current writable Btrfs project, including dirty and
-untracked files. It refuses external/shared Git metadata, object alternates,
-nested Git repositories/submodules and nested subvolumes. It checks Git metadata
-independence again after cloning. Use a supported native Git worktree or
-explicitly adopted shared workspace for those layouts. Ordinary resume reuses
-the current workspace and preserves subsequent changes. Filesystem aliases are
-matched through canonical paths, inode/device and Btrfs subvolume identity.
-An active lease prevents a second process from resuming the same registered
-thread. Different threads can deliberately share the original project.
-
-Records under `CODEX_HOME/ai-fence-workspaces` are versioned metadata: thread,
-profile/store, logical root, physical project/workspace identity, checkpoint
-references, pin state and process/start/boot leases. They contain no messages or
-credentials. Missing/replaced workspaces fail explicitly. Resume never restores
-a pre-launch checkpoint. To adopt an existing thread without moving history:
-
-```bash
-ai-fence-cli codex-desktop --install-root /absolute/install/root workspace adopt \
-  --thread-id THREAD_ID --project /original/project [--workspace /chosen/shared/workspace]
-# Preview first; --apply registers the explicit choice and preserves the old record.
-```
-
-Adoption uses native `thread/read` metadata and validates the original project;
-it does not merge SQLite, rewrite transcripts, change provider metadata, or link
-accounts. To recover to a new workspace from a selected complete single-member
-checkpoint, use `workspace recover --thread-id ID --project ORIGINAL_ROOT
---checkpoint /set/manifest.json --directory /same-btrfs/workspaces`, inspect the
-preview, then add `--apply`. It preserves the current workspace and previous
-record. Nested checkpoint reconstruction and in-place restore are deliberately
-manual in this version. Conversation and filesystem checkpoints have coordinated
-references, but they are not automatically the same instant in time.
-
-Interactive native CLI pickers do not expose new-thread notifications to their
-parent. Explicit registered CLI resume IDs reattach and lease the saved workspace;
-new picker-created CLI threads need explicit adoption before workspace management.
-`resume --all`, explicit session IDs and native directory flags are forwarded.
-A registered isolated workspace requires explicit adoption to change cwd.
-Daemon and network-listener app-server transports are rejected because they can
-outlive the owning proxy; the desktop stdio transport is supported. Setup probes
-native `--no-daemon` support and uses it for fenced CLI runs when available.
-Checkpoints currently require the thread cwd itself to be an approved subvolume
-root; subdirectory cwd checkpointing needs explicit root-level helper commands.
+Daemon and network-listener app-server transports are rejected because they
+can outlive the owning proxy; desktop stdio is supported. Setup probes native
+`--no-daemon` support for interactive CLI runs. Checkpointing currently requires
+the thread cwd itself to be an approved subvolume root. Writable clones reject
+nested subvolumes/mounts and external/shared Git metadata. Explicit checkpoint
+recovery creates a new workspace; automatic in-place restore is not provided.
 
 ## Doctor, rollback and session-only opt-out
 
 ```bash
 ai-fence-cli codex-desktop --install-root /absolute/install/root doctor --strict
 ai-fence-cli codex-desktop --install-root /absolute/install/root doctor --thread-id THREAD_ID
-ai-fence-cli codex-desktop --install-root /absolute/install/root workspace cleanup --limit 32
+ai-fence-cli ws ls
+ai-fence-cli ws rm feature-a  # preview only
 AI_FENCE_SNAPSHOTS=off /absolute/install/root/bin/codex app-server
 AI_FENCE_CODEX_DESKTOP=0 /absolute/install/root/bin/codex app-server
 ```
@@ -185,7 +278,12 @@ cwd filtering only within the selected native store; it cannot find another
 store's conversations. Newer options such as `tui.resume_cwd` are not assumed.
 
 `AI_FENCE_CODEX_DESKTOP=0` selects native OpenAI routing for that invocation and
-retains the same state home; it writes no persistent bypass marker. For a Windows
+retains the same state home; it writes no persistent bypass marker. With a separate
+native credential owner, the stdio auth bridge remains in memory so this invocation
+still uses that owner's login instead of stale history-profile credentials. No
+Fence proxy is started, and doctor labels the launch `native-stdio`/`fenced: false`.
+Shared-owner TUI remains unsupported, including opt-out; use the ordinary native
+CLI entry point or explicitly select profile auth during setup. For a Windows
 session use `codex-session.ps1 -Mode Native` when ready to quit the prior app.
 Close that session and launch fenced mode to return. `rollback` switches to the
 previous verified installed release without restoring history/filesystem state;

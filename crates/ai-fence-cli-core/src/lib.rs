@@ -4,10 +4,13 @@ pub mod config;
 pub mod open_interpreter;
 pub mod openclaw;
 pub mod proxy;
+pub mod workspace;
 pub mod workspace_snapshot;
 
 /// Bundled desktop adapter, installer and lifecycle helper (no private engine).
 pub const CODEX_DESKTOP_RUNTIME: &str = include_str!("../assets/codex_desktop.py");
+pub const CODEX_DESKTOP_AUTH_RUNTIME: &str = include_str!("../assets/codex_desktop_auth.py");
+pub const CODEX_DESKTOP_UPDATE_RUNTIME: &str = include_str!("../assets/codex_desktop_updates.py");
 
 #[cfg(test)]
 mod boundary_tests {
@@ -23,12 +26,20 @@ mod boundary_tests {
             include_str!("open_interpreter.rs"),
             include_str!("openclaw.rs"),
             include_str!("proxy.rs"),
+            include_str!("workspace.rs"),
+            include_str!("workspace/storage.rs"),
+            include_str!("workspace/leases.rs"),
+            include_str!("workspace/recovery.rs"),
+            include_str!("workspace/shells.rs"),
+            include_str!("workspace/command.rs"),
             include_str!("workspace_snapshot.rs"),
             include_str!("workspace_snapshot/command.rs"),
             include_str!("workspace_snapshot/discovery.rs"),
             include_str!("workspace_snapshot/sets.rs"),
             include_str!("bin/ai-fence-snapshot.rs"),
             include_str!("../assets/codex_desktop.py"),
+            include_str!("../assets/codex_desktop_auth.py"),
+            include_str!("../assets/codex_desktop_updates.py"),
         ];
         for source in sources {
             for private_path in [

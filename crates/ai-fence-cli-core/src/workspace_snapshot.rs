@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod command;
-mod discovery;
+pub(crate) mod discovery;
 pub use command::{execute, SnapshotAction};
 mod sets;
 pub use sets::{pin, prune, prune_bounded, PrunePlan};
@@ -21,7 +21,7 @@ pub enum SnapshotPolicy {
 
 impl SnapshotPolicy {
     pub fn parse(value: Option<&str>) -> Result<Self> {
-        match value.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
+        match value.unwrap_or("off").trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
             "off" => Ok(Self::Off),
             "required" => Ok(Self::Required),
@@ -38,6 +38,14 @@ impl SnapshotPolicy {
             })
             .transpose()?;
         Self::parse(value.as_deref())
+    }
+}
+
+fn off_reason() -> &'static str {
+    if std::env::var_os("AI_FENCE_SNAPSHOTS").is_some() {
+        "disabled by AI_FENCE_SNAPSHOTS=off"
+    } else {
+        "automatic checkpoint creation is off by default"
     }
 }
 
@@ -373,10 +381,7 @@ pub fn list(config: &SnapshotConfig) -> Result<Vec<Checkpoint>> {
 pub fn prepare_launch(cwd: impl FnOnce() -> Result<PathBuf>) -> Result<SnapshotOutcome> {
     let policy = SnapshotPolicy::from_env()?;
     if policy == SnapshotPolicy::Off {
-        return Ok(SnapshotOutcome::skipped(
-            "off",
-            "disabled by AI_FENCE_SNAPSHOTS=off",
-        ));
+        return Ok(SnapshotOutcome::skipped("off", off_reason()));
     }
     let cwd = match cwd() {
         Ok(cwd) => cwd,
@@ -417,10 +422,7 @@ fn prepare_with_backend(
     backend: &dyn Backend,
 ) -> Result<SnapshotOutcome> {
     if policy == SnapshotPolicy::Off {
-        return Ok(SnapshotOutcome::skipped(
-            "off",
-            "disabled by AI_FENCE_SNAPSHOTS=off",
-        ));
+        return Ok(SnapshotOutcome::skipped("off", off_reason()));
     }
     let result = (|| {
         let config = config.context("no workspace subvolume explicitly approved")?;
@@ -605,7 +607,7 @@ mod tests {
     }
     #[test]
     fn policies_are_explicit() {
-        assert_eq!(SnapshotPolicy::parse(None).unwrap(), SnapshotPolicy::Auto);
+        assert_eq!(SnapshotPolicy::parse(None).unwrap(), SnapshotPolicy::Off);
         assert_eq!(
             SnapshotPolicy::parse(Some("off")).unwrap(),
             SnapshotPolicy::Off

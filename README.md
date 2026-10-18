@@ -33,6 +33,11 @@ logging, and manual install details.
 For model access that works while `codex-apps` or `/usage` requests login, see
 [Codex native authentication limitations and safe next steps](CODEX_AUTH.md).
 
+The [named workspace workflow](WORKSPACES.md), starting with v0.1.8, provides persistent
+writable Btrfs copies for parallel agents, short `fws` commands and ordinary
+`cd` followed by existing fenced aliases. CLI and Codex desktop share workspace
+identity and leases; read-only checkpoints are separately opt-in.
+
 ## Source boundary
 
 The proprietary request-processing engine is intentionally not part of this

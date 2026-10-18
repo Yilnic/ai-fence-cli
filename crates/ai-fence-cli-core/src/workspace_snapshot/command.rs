@@ -58,19 +58,23 @@ pub enum SnapshotAction {
 /// Shared native/standalone CLI contract. Callers render this value as JSON.
 pub fn execute(action: SnapshotAction) -> Result<serde_json::Value> {
     let policy = SnapshotPolicy::from_env()?;
+    // An explicit helper command is opt-in even when automatic launch
+    // checkpoints default to off. An explicit operator off override wins.
+    let explicitly_off =
+        policy == SnapshotPolicy::Off && std::env::var_os("AI_FENCE_SNAPSHOTS").is_some();
     Ok(match action {
         SnapshotAction::Inspect(paths) => super::inspect_scope(&paths.into())?,
         SnapshotAction::Status(paths) => serde_json::to_value(if policy == SnapshotPolicy::Off {
             SnapshotOutcome {
                 status: "off".into(),
-                reason: Some("disabled by AI_FENCE_SNAPSHOTS=off".into()),
+                reason: Some(super::off_reason().into()),
                 checkpoint: None,
             }
         } else {
             super::status(&paths.into())
         })?,
         SnapshotAction::Create(paths) => {
-            if policy == SnapshotPolicy::Off {
+            if explicitly_off {
                 bail!("checkpoint creation disabled by AI_FENCE_SNAPSHOTS=off");
             }
             serde_json::to_value(super::create(&paths.into())?)?
@@ -84,7 +88,7 @@ pub fn execute(action: SnapshotAction) -> Result<serde_json::Value> {
             apply,
             limit,
         } => {
-            if apply && policy == SnapshotPolicy::Off {
+            if apply && explicitly_off {
                 bail!("snapshot mutations disabled by AI_FENCE_SNAPSHOTS=off");
             }
             serde_json::to_value(super::prune_bounded(

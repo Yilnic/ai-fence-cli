@@ -43,3 +43,24 @@ fn invalid_policy_is_diagnostic_and_does_not_create_directories() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("must be auto, off, or required"));
     assert!(!root.exists());
 }
+
+#[test]
+fn explicit_create_opts_in_when_automatic_checkpoints_default_to_off() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ai-fence-snapshot"))
+        .env_remove("AI_FENCE_SNAPSHOTS")
+        .env_remove("AI_FENCE_SNAPSHOT_ROOTS_FILE")
+        .env("PATH", "/nonexistent")
+        .args([
+            "create",
+            "--root",
+            "/missing-explicit-root",
+            "--directory",
+            "/missing-explicit-store",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("disabled by AI_FENCE_SNAPSHOTS=off"),
+        "an explicit create command is already opt-in; only an explicit off override should block it");
+    assert!(output.stdout.is_empty());
+}

@@ -41,6 +41,23 @@ preserves the updated file when returning the rental. See the
 [Codex configuration guide](https://learn.chatgpt.com/docs/config-file/config-advanced)
 and [app-server auth API](https://learn.chatgpt.com/docs/app-server).
 
+## Desktop native credential owner (unreleased)
+
+The official desktop setup can retain an existing Fence history store while
+using the native/default credential home as its single OAuth owner. Fresh setups
+select native `CODEX_HOME`; upgrades retain their previous choice unless given
+`--auth-home`. A stale managed profile auth file is preserved and ignored by the
+externally authenticated desktop process. Native account APIs own login, logout
+and refresh; only access tokens are supplied in memory to Codex's external-token
+API. Different accounts cannot silently be attached to one history profile.
+
+Use `ai-fence-cli codex-desktop --install-root PATH doctor --check-auth` to check
+the selected owner with a bounded read-only provider request. A successful TCP
+connection, history read or native/default login alone does not validate another
+profile's credentials. This mode currently requires file credentials and the
+native external-token API. Select the profile path as `--auth-home` for keyring,
+API-key or native-TUI use. See [desktop setup](CODEX_DESKTOP_WSL.md).
+
 ## Safe next steps
 
 1. Identify the selected AI Fence profile and its configured lane. Named

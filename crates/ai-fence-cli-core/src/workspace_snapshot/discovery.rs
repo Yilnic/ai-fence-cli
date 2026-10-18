@@ -6,7 +6,7 @@ use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
-pub(super) fn descendants(root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn descendants(root: &Path) -> Result<Vec<PathBuf>> {
     use std::collections::{HashSet, VecDeque};
     use std::ffi::OsString;
     use std::os::fd::AsRawFd;
@@ -115,12 +115,12 @@ pub(super) fn descendants(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(super) fn descendants(_: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn descendants(_: &Path) -> Result<Vec<PathBuf>> {
     bail!("recursive Btrfs checkpoints require Linux")
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn uuid(root: &Path) -> Result<String> {
+pub(crate) fn uuid(root: &Path) -> Result<String> {
     use std::os::fd::AsRawFd;
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -168,7 +168,7 @@ pub(super) fn uuid(root: &Path) -> Result<String> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn filesystem_id(path: &Path) -> Result<[u8; 16]> {
+pub(crate) fn filesystem_id(path: &Path) -> Result<[u8; 16]> {
     use std::os::fd::AsRawFd;
     #[repr(C)]
     struct FilesystemInfo {
@@ -205,6 +205,11 @@ pub(super) fn filesystem_id(path: &Path) -> Result<[u8; 16]> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(super) fn filesystem_id(_: &Path) -> Result<[u8; 16]> {
+pub(crate) fn filesystem_id(_: &Path) -> Result<[u8; 16]> {
     bail!("Btrfs workspace checkpoints require Linux")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn uuid(_: &Path) -> Result<String> {
+    bail!("Btrfs workspaces require Linux/WSL")
 }

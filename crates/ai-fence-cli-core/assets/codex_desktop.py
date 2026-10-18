@@ -32,6 +32,15 @@ import threading
 import time
 import uuid
 from urllib.parse import urlsplit
+import importlib.util
+
+_auth_spec = importlib.util.spec_from_file_location("ai_fence_codex_auth", Path(__file__).with_name("codex_desktop_auth.py"))
+auth_runtime = importlib.util.module_from_spec(_auth_spec)
+_auth_spec.loader.exec_module(auth_runtime)
+auth_policy = auth_runtime.policy
+_update_spec = importlib.util.spec_from_file_location("ai_fence_codex_updates", Path(__file__).with_name("codex_desktop_updates.py"))
+updates = importlib.util.module_from_spec(_update_spec)
+_update_spec.loader.exec_module(updates)
 
 WINDOWS_SESSION_LAUNCHER = r'''[CmdletBinding()]
 param(
@@ -191,6 +200,11 @@ def install(args):
         no_daemon_supported = native_help.returncode == 0 and b"--no-daemon" in native_help.stdout
         settings_path = root / "settings.json"
         old = load(settings_path) if settings_path.exists() else None
+        prepared = getattr(args, "prepare_only", None)
+        destination = Path(prepared).resolve() if prepared else root
+        destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if prepared and (destination == root or any(destination.iterdir())):
+            fail("update preparation requires an empty private staging directory")
         if old:
             for name, expected in old["files"].items():
                 owned = root / name
@@ -198,24 +212,59 @@ def install(args):
                     fail("owned installation file changed; preserve and inspect it before upgrading")
         elif (root / "dispatch.py").exists():
             fail("unowned dispatch file exists")
+        launch_prefix = getattr(args, "launch_prefix", None)
+        if launch_prefix is None:
+            launch_prefix = (old or {}).get("launch_prefix", [])
+        if launch_prefix:
+            trusted(Path(launch_prefix[0]), True)
         for name in ["codex", "codex-runtime", "ai-fence-snapshot"]:
             candidate = root / "bin" / name
             if candidate.is_symlink() or (candidate.exists() and not old):
                 fail("unowned adapter command exists; choose an empty install root")
         home = args.state_home.expanduser().resolve()
-        home.mkdir(parents=True, exist_ok=True, mode=0o700)
         if old and (old["state_home"] != str(home) or old["profile"] != args.profile):
             fail("upgrade cannot change profile/state-home identity; use a separate installation")
+        if old:
+            if not home.is_dir() or identity(home) != old["state_identity"]:
+                fail("installed state home is missing or replaced; reattach its filesystem without creating a replacement")
+        else:
+            home.mkdir(parents=True, exist_ok=True, mode=0o700)
         profile_name(args.profile)
+        selected_auth = getattr(args, "auth_home", None) or (old or {}).get("auth_home")
+        if selected_auth is None:
+            # An upgrade retains its account boundary until explicitly selected.
+            selected_auth = home if old else Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        auth = auth_policy(home, Path(selected_auth).expanduser(), expected_key=(old or {}).get("auth_account_key"))
+        if old and old.get("auth_account_key") and auth.get("auth_account_key") != old["auth_account_key"]:
+            fail("upgrade cannot change the credential account bound to existing history")
+        if auth["auth_mode"] == "native-owner":
+            with tempfile.TemporaryDirectory(prefix="af-codex-schema-") as schema:
+                probe_env = os.environ.copy()
+                probe_env["CODEX_HOME"] = schema
+                probe = subprocess.run([str(native), "app-server", "generate-json-schema", "--out", schema],
+                                       env=probe_env, capture_output=True, timeout=15)
+                login_schema = Path(schema) / "v2/LoginAccountParams.json"
+                if (probe.returncode or not login_schema.is_file() or
+                        '"chatgptAuthTokens"' not in login_schema.read_text() or
+                        not (Path(schema) / "ChatgptAuthTokensRefreshResponse.json").exists()):
+                    fail("native Codex lacks the external-token login/refresh API; update native Codex or select profile auth")
         if args.snapshots != "off" and args.approve_root and not args.snapshot_directory:
             fail("approved roots require --snapshot-directory on the same Btrfs filesystem")
         files = {}
         runtime = Path(__file__).read_bytes()
-        release_id = hashlib.sha256(runtime + digest(cli).encode()).hexdigest()[:24]
+        auth_body = Path(__file__).with_name("codex_desktop_auth.py").read_bytes()
+        update_body = Path(__file__).with_name("codex_desktop_updates.py").read_bytes()
+        cli_probe = subprocess.run([str(cli), "--version"], capture_output=True, timeout=10,
+                                   env={"PATH":os.environ.get("PATH", "/usr/bin:/bin")})
+        cli_match = re.fullmatch(rb"ai-fence-cli ([0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?)\s*", cli_probe.stdout)
+        cli_version = cli_match[1].decode() if cli_probe.returncode == 0 and cli_match else "unknown"
+        release_id = hashlib.sha256(runtime + auth_body + update_body + digest(cli).encode()).hexdigest()[:24]
         release = root / "releases" / release_id
         release.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Content-addressed releases retain binaries used by running processes.
-        for name, data, mode in [("runtime.py", runtime, 0o700), ("codex-session.ps1", WINDOWS_SESSION_LAUNCHER.encode(), 0o600)]:
+        for name, data, mode in [("runtime.py", runtime, 0o700), ("codex_desktop_auth.py", auth_body, 0o600),
+                                 ("codex_desktop_updates.py", update_body, 0o600),
+                                 ("codex-session.ps1", WINDOWS_SESSION_LAUNCHER.encode(), 0o600)]:
             dest = release / name
             if not dest.exists():
                 atomic(dest, data, mode)
@@ -241,34 +290,41 @@ def install(args):
         files[str(release_helper.relative_to(root))] = digest(release_helper)
         for name, mode in [("codex", "adapter"), ("codex-runtime", "runtime"), ("ai-fence-snapshot", "snapshot")]:
             wrapper = root / "bin" / name
-            body = ("#!/bin/sh\n" + MARKER + "\nexec " + shell(sys.executable) + " "
+            prefix = " ".join(shell(value) for value in launch_prefix)
+            body = ("#!/bin/sh\n" + MARKER + "\nexec " + (prefix + " " if prefix else "") + shell(sys.executable) + " "
                     + shell(str(root / "dispatch.py")) + " " + mode + ' "$@"\n')
             if wrapper.exists() and MARKER not in wrapper.read_text():
                 fail("unowned adapter command exists; choose an empty install root")
-            atomic(wrapper, body, 0o700)
-            files[str(wrapper.relative_to(root))] = digest(wrapper)
+            target_wrapper = destination / wrapper.relative_to(root)
+            atomic(target_wrapper, body, 0o700)
+            files[str(wrapper.relative_to(root))] = digest(target_wrapper)
         # Stable dispatch selects one immutable release per invocation.
-        dispatch = 'import json,os,sys\nfrom pathlib import Path\nr=Path(__file__).resolve().parent\ns=json.loads((r/"settings.json").read_text())\nos.execv(sys.executable,[sys.executable,str(r/"releases"/s["release"]/"runtime.py"),*sys.argv[1:]])\n'
+        dispatch = 'import json,os,sys\nfrom pathlib import Path\nr=Path(__file__).resolve().parent\ns=json.loads((r/"settings.json").read_text())\nos.environ["_AI_FENCE_DESKTOP_SETTINGS"]=json.dumps(s)\nos.execv(sys.executable,[sys.executable,str(r/"releases"/s["release"]/"runtime.py"),*sys.argv[1:]])\n'
         if (root / "dispatch.py").exists() and old is None:
             fail("unowned dispatch file exists")
-        atomic(root / "dispatch.py", dispatch, 0o700)
-        files["dispatch.py"] = digest(root / "dispatch.py")
+        atomic(destination / "dispatch.py", dispatch, 0o700)
+        files["dispatch.py"] = digest(destination / "dispatch.py")
         settings = dict(format=FORMAT, install_root=str(root), release=release_id,
                         native_codex=str(native), native_version=version, native_sha256=digest(native), no_daemon_supported=no_daemon_supported,
                         profile=profile_name(args.profile), state_home=str(home), state_identity=identity(home), readiness_seconds=args.readiness_seconds,
-                        seed_home=str(args.seed_home.expanduser().resolve()) if args.seed_home else str(home),
+                        workspace_registry=str((getattr(args, "workspace_registry", None) or Path(os.environ.get("AI_FENCE_WORKSPACE_HOME", Path.home() / ".ai-fence/workspace-registry"))).expanduser().absolute()),
+                        seed_home=str(home),
                         snapshot_policy=args.snapshots, roots=[str(p.expanduser().absolute()) for p in args.approve_root],
                         snapshot_directory=str(args.snapshot_directory.expanduser().absolute()) if args.snapshot_directory else None,
-                        files=files)
+                        files=files, launch_prefix=launch_prefix, cli_version=cli_version, cli_sha256=digest(cli),
+                        update_policy=getattr(args, "updates", None) or (old or {}).get("update_policy", "auto"),
+                        update_base_url=getattr(args, "update_base_url", None) or (old or {}).get("update_base_url", "https://ai.yml.world"),
+                        update_interval_seconds=getattr(args, "update_interval_seconds", None) or (old or {}).get("update_interval_seconds", 86400), **auth)
+        updates.safe_url(settings["update_base_url"])
         if settings["snapshot_policy"] != "off" and settings["roots"] and not settings["snapshot_directory"]:
             fail("approved roots require --snapshot-directory on the same Btrfs filesystem")
-        save(root / "snapshot-roots.json", dict(format=FORMAT, roots=settings["roots"]))
-        if old and old != settings:
+        save(destination / "snapshot-roots.json", dict(format=FORMAT, roots=settings["roots"]))
+        if old and old != settings and not prepared:
             save(root / "previous-settings.json", old)
-        if args.snapshots != "off":
+        if args.snapshots != "off" and not prepared:
             install_guidance(home)
         # This is the only release switch; existing children retain old settings.
-        save(settings_path, settings)
+        save(destination / "settings.json", settings)
         print(json.dumps({"installed": True, "adapter": str(root / "bin/codex"),
                           "profile": settings["profile"], "state_home": str(home),
                           "native_version": version, "release": release_id,
@@ -281,6 +337,67 @@ def shell(value):
 
 def cli_payload(settings):
     return Path(settings["install_root"]) / "releases" / settings.get("release", "fixture") / "ai-fence-cli"
+
+
+def named_registry(settings):
+    return Path(settings.get("workspace_registry", os.environ.get("AI_FENCE_WORKSPACE_HOME", Path.home() / ".ai-fence/workspace-registry")))
+
+
+def named_call(settings, action, *arguments, registry=None):
+    """Shared public workspace engine; only IDs, paths and lifecycle metadata."""
+    env = os.environ.copy()
+    env["AI_FENCE_WORKSPACE_HOME"] = str(registry or named_registry(settings))
+    env["AI_FENCE_CLI_AUTO_UPDATE"] = "never"
+    result = subprocess.run([str(cli_payload(settings)), "workspace", action, *map(str, arguments)],
+                            env=env, capture_output=True, timeout=20)
+    if result.returncode:
+        detail = result.stderr.decode(errors="replace").strip()
+        fail("named workspace unavailable: " + (detail[-500:] or "inspect ai-fence-cli workspace status"))
+    return json.loads(result.stdout)
+
+
+def named_context(settings, cwd):
+    physical = Path(cwd).resolve(strict=True)
+    if not any((root / ".ai-fence-workspace.json").exists() for root in [physical, *physical.parents]) and not (named_registry(settings) / "records").exists():
+        return None
+    return named_call(settings, "status", "--path", physical)
+
+
+def same_named_identity(expected, path):
+    actual = identity(path)
+    if expected.get("subvolume_uuid"):
+        return expected["subvolume_uuid"] == actual["subvolume_uuid"] and expected["inode"] == actual["inode"]
+    return (expected["device"], expected["inode"]) == (actual["device"], actual["inode"])
+
+
+def named_resume(settings, parameters):
+    thread_id = parameters.get("threadId")
+    if not thread_id:
+        return False
+    path = record_path(settings, thread_id)
+    local = load(path) if path.exists() else None
+    reference = (local or {}).get("named_workspace")
+    registry = Path(reference["registry"]) if reference else named_registry(settings)
+    if not (registry / "records").exists():
+        if reference:
+            fail("saved named workspace registry is missing; explicit recovery is required")
+        return False
+    saved = named_call(settings, "_resolve", "--thread-id", thread_id,
+                       "--profile", settings["profile"], "--state-home", settings["state_home"], registry=registry)
+    if not saved:
+        if reference:
+            fail("thread workspace link is missing from the selected profile/store; inspect before recovery")
+        return False
+    record, expected = saved["record"], saved["cwd"]
+    if parameters.get("cwd"):
+        selected = named_context(settings, parameters["cwd"])
+        if not selected or selected["id"] != record["id"]:
+            fail("resume selected another named workspace; start/fork a thread there explicitly")
+    else:
+        if not expected or not same_named_identity(expected, expected["path"]):
+            fail("saved thread directory is missing/replaced; explicit recovery is required")
+        parameters["cwd"] = expected["path"]
+    return True
 
 
 def install_guidance(home):
@@ -369,6 +486,26 @@ def subcommand(arguments):
     return None, None
 
 
+def native_cwd(arguments):
+    directory = Path.cwd()
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value == "--":
+            break
+        if value in {"-C", "--cd"}:
+            index += 1
+            if index == len(arguments):
+                fail("Codex -C/--cd needs a directory")
+            directory = Path.cwd() / arguments[index]
+        elif value.startswith("--cd="):
+            directory = Path.cwd() / value[5:]
+        elif value.startswith("-C") and len(value) > 2:
+            directory = Path.cwd() / value[2:]
+        index += 1
+    return directory
+
+
 def runtime(settings, arguments):
     value = os.environ.get("OPENAI_BASE_URL", "")
     endpoint(value)
@@ -381,6 +518,8 @@ def runtime(settings, arguments):
         arguments.insert(index, "--no-daemon")
     arguments[index:index] = ["-c", 'model_provider="ai_fence"', "-c",
                              "model_providers.ai_fence=" + '{name="AI Fence", wire_api="responses", requires_openai_auth=true, base_url=' + json.dumps(value) + '}']
+    if settings.get("auth_mode") == "native-owner":
+        arguments[index:index] = ["-c", 'cli_auth_credentials_store="ephemeral"']
     env = os.environ.copy()
     env["AI_FENCE_SNAPSHOTS"] = env.pop("_AI_FENCE_DESKTOP_CHECKPOINT_POLICY", settings["snapshot_policy"])
     for key in ["AI_FENCE_SNAPSHOT_ROOT", "AI_FENCE_SNAPSHOT_ID", "AI_FENCE_SNAPSHOT_PATH", "AI_FENCE_SNAPSHOT_RECEIPT"]:
@@ -437,7 +576,7 @@ def record_path(settings, thread_id):
     return Path(settings["state_home"]) / "ai-fence-workspaces" / (thread_id + ".json")
 
 
-def attach(settings, thread_id, cwd, lease, checkpoint=None, mode="checkpoint"):
+def attach(settings, thread_id, cwd, lease, checkpoint=None, mode="checkpoint", named=None):
     path = record_path(settings, thread_id)
     with lock(path.with_suffix(".lock")):
         project = identity(cwd)
@@ -445,7 +584,7 @@ def attach(settings, thread_id, cwd, lease, checkpoint=None, mode="checkpoint"):
             record = load(path)
             if not Path(record["workspace"]["physical"]).exists():
                 fail("saved workspace is missing; recover to a new workspace from a chosen checkpoint or explicitly adopt a replacement")
-            if record["workspace"] != project:
+            if record["workspace"] != project and not (named and record.get("named_workspace", {}).get("id") == named["id"]):
                 fail("resume requested another workspace; explicit adoption/recovery is required")
             if record["profile"] != settings["profile"] or record["state_home"] != settings["state_home"]:
                 fail("profile/state-home identity mismatch")
@@ -459,6 +598,13 @@ def attach(settings, thread_id, cwd, lease, checkpoint=None, mode="checkpoint"):
         record["leases"].append(lease)
         if checkpoint and checkpoint not in record["checkpoints"]:
             record["checkpoints"].append(checkpoint)
+        if named:
+            record["mode"] = "named"
+            record["workspace"] = project
+            record["logical_root"] = str(cwd)
+            source = named["project"]
+            record["project"] = dict(physical=source["path"], device=source["device"], inode=source["inode"], subvolume_uuid=source["subvolume_uuid"])
+            record["named_workspace"] = {key: named[key] for key in ["id", "name", "registry"]}
         save(path, record)
         return record
 
@@ -474,6 +620,7 @@ def checkpoint(settings, cwd, thread_id):
             fail("required checkpoint needs the current project in the explicit approved-root registry")
         return None
     env = os.environ.copy()
+    env["AI_FENCE_SNAPSHOTS"] = os.environ.get("AI_FENCE_SNAPSHOTS", settings["snapshot_policy"])
     env.pop("AI_FENCE_SNAPSHOT_ROOT", None)
     policy = Path(settings["install_root"]) / "snapshot-roots.json"
     env["AI_FENCE_SNAPSHOT_ROOTS_FILE"] = str(policy)
@@ -498,6 +645,13 @@ def preflight_resume(settings, parameters):
     thread_id = parameters.get("threadId")
     if not thread_id:
         return
+    if named_resume(settings, parameters):
+        path = record_path(settings, thread_id)
+        if path.exists():
+            record = load(path)
+            if any(alive(item) and item["pid"] != os.getpid() for item in record["leases"]):
+                fail("thread already has an active workspace lease")
+        return
     path = record_path(settings, thread_id)
     if path.exists():
         record = load(path)
@@ -518,6 +672,12 @@ def preflight_resume(settings, parameters):
                 parameters["cwd"] = str(logical)
             else:
                 parameters["cwd"] = str(current)
+    elif not parameters.get("cwd") and settings.get("native_codex"):
+        # A CLI-created thread may not yet have a Fence registration. Query
+        # native metadata, without turns, to find its existing named workspace.
+        thread = native_thread(settings, thread_id)
+        if thread and thread.get("cwd") and named_context(settings, thread["cwd"]):
+            parameters["cwd"] = thread["cwd"]
 
 
 class Lifecycle:
@@ -525,39 +685,140 @@ class Lifecycle:
     def __init__(self, settings, lease):
         self.settings, self.lease = settings, lease
         self.pending = {}
-        self.gate = threading.Lock()
+        self.gate = threading.RLock()
         self.threads = set()
+        self.named = {}
+        self.named_threads = {}
+        self.startup = set()
+        self.child_pid = None
+        self.opt_out = set()
+
+    def reserve(self, cwd, thread_id=None):
+        if not named_context(self.settings, cwd):
+            return None
+        args = ["--path", cwd, "--pid", self.lease["pid"]]
+        if self.child_pid:
+            args.extend(["--child-pid", self.child_pid])
+        inherited = os.environ.get("AI_FENCE_WORKSPACE_LEASE")
+        if inherited:
+            args.extend(["--inherited", inherited])
+        if thread_id:
+            args.extend(["--thread-id", thread_id, "--profile", self.settings["profile"],
+                         "--state-home", self.settings["state_home"]])
+        value = named_call(self.settings, "_attach", *args)
+        if value:
+            with self.gate:
+                self.named.setdefault(value["id"], value)
+                if thread_id:
+                    self.named_threads[thread_id] = value["id"]
+        return value
+
+    def release_unused(self, workspace_id):
+        with self.gate:
+            if workspace_id in self.startup or workspace_id in self.named_threads.values():
+                return
+            if any(pending.get("workspace") == workspace_id for pending in self.pending.values()):
+                return
+            value = self.named.pop(workspace_id, None)
+        if value and value["owned"]:
+            named_call(self.settings, "_release", "--id", value["id"], "--lease", value["lease"],
+                       "--pid", self.lease["pid"], registry=value["registry"])
+
+    def closed_thread(self, thread_id):
+        with self.gate:
+            workspace_id = self.named_threads.pop(thread_id, None)
+            self.threads.discard(thread_id)
+        if thread_id:
+            path = record_path(self.settings, thread_id)
+            if path.exists():
+                with lock(path.with_suffix(".lock")):
+                    record = load(path)
+                    record["leases"] = [item for item in record["leases"] if item != self.lease and alive(item)]
+                    save(path, record)
+        if workspace_id:
+            self.release_unused(workspace_id)
+
+    def close(self):
+        with self.gate:
+            self.pending.clear()
+            self.startup.clear()
+            threads = list(self.threads)
+        for thread_id in threads:
+            self.closed_thread(thread_id)
+        for workspace_id in list(self.named):
+            self.release_unused(workspace_id)
 
     def request(self, value):
         method = value.get("method")
         parameters = value.get("params") or {}
-        if method in {"thread/resume", "turn/start"}:
+        if method == "initialize":
+            capabilities = parameters.get("capabilities") or {}
+            if isinstance(capabilities, dict):
+                requested = capabilities.get("optOutNotificationMethods")
+                if isinstance(requested, list):
+                    self.opt_out = {item for item in requested if isinstance(item, str)}
+                    observed = {"thread/started", "thread/closed", "thread/status/changed"}
+                    capabilities["optOutNotificationMethods"] = [item for item in requested if item not in observed]
+        resumed = method in {"thread/resume", "turn/start", "thread/shellCommand"}
+        if resumed:
+            preflight_resume(self.settings, parameters)
+        if method == "thread/fork" and not parameters.get("cwd") and self.settings.get("native_codex"):
+            parent = native_thread(self.settings, parameters.get("threadId"))
+            if parent and parent.get("cwd"):
+                parameters["cwd"] = parent["cwd"]
+        reservation = None
+        if method in {"thread/start", "thread/resume", "thread/fork", "turn/start", "thread/shellCommand"}:
+            cwd = parameters.get("cwd")
+            if not cwd and method == "thread/start":
+                cwd = os.getcwd()
+            if cwd:
+                reservation = self.reserve(cwd)
+        if resumed:
             thread_id = parameters.get("threadId")
             path = record_path(self.settings, thread_id) if thread_id else None
-            if path and path.exists():
-                with lock(path.with_suffix(".lock")):
-                    preflight_resume(self.settings, parameters)
-                    record = load(path)
-                    record["leases"] = [v for v in record["leases"] if alive(v) and v != self.lease]
-                    record["leases"].append(self.lease)
-                    save(path, record)
-            else:
-                preflight_resume(self.settings, parameters)
-        if method in {"thread/start", "thread/resume", "thread/fork"} and "id" in value:
+            try:
+                if path and path.exists():
+                    with lock(path.with_suffix(".lock")):
+                        preflight_resume(self.settings, parameters)
+                        record = load(path)
+                        record["leases"] = [v for v in record["leases"] if alive(v) and v != self.lease]
+                        record["leases"].append(self.lease)
+                        save(path, record)
+            except BaseException:
+                if reservation:
+                    self.release_unused(reservation["id"])
+                raise
+        if method in {"thread/start", "thread/resume", "thread/fork", "thread/unsubscribe", "turn/start", "thread/shellCommand"} and "id" in value:
             with self.gate:
-                self.pending[str(value["id"])] = method
+                self.pending[str(value["id"])] = dict(method=method, thread_id=parameters.get("threadId"),
+                                                     workspace=reservation["id"] if reservation else None)
 
     def response(self, value):
         with self.gate:
-            method = self.pending.pop(str(value.get("id")), None)
-        thread = (value.get("result") or {}).get("thread") if method else None
+            pending = self.pending.pop(str(value.get("id")), None)
+        thread = (value.get("result") or {}).get("thread") if pending else None
         if value.get("method") == "thread/started":
             thread = value.get("params", {}).get("thread")
         if isinstance(thread, dict) and thread.get("id") and thread.get("cwd"):
             thread_id, cwd = thread["id"], thread["cwd"]
+            named = self.reserve(cwd, thread_id)
             receipt = checkpoint(self.settings, cwd, thread_id) if thread_id not in self.threads else None
-            attach(self.settings, thread_id, cwd, self.lease, receipt)
+            attach(self.settings, thread_id, cwd, self.lease, receipt, named=named)
             self.threads.add(thread_id)
+        method, parameters = value.get("method"), value.get("params", {})
+        if method == "thread/closed" or (method == "thread/status/changed" and parameters.get("status", {}).get("type") == "notLoaded"):
+            self.closed_thread(parameters.get("threadId"))
+        if pending:
+            if "error" in value and pending["thread_id"] and pending["thread_id"] not in self.threads:
+                self.closed_thread(pending["thread_id"])
+            if not thread and "error" not in value and pending["method"] in {"turn/start", "thread/shellCommand"} and pending["workspace"]:
+                self.named_threads[pending["thread_id"]] = pending["workspace"]
+                self.threads.add(pending["thread_id"])
+            if pending["method"] == "thread/unsubscribe" and value.get("result", {}).get("status") == "notLoaded":
+                self.closed_thread(pending["thread_id"])
+            if pending["workspace"]:
+                self.release_unused(pending["workspace"])
+        return value.get("method") not in self.opt_out
 
 
 def adapter(settings, arguments):
@@ -572,9 +833,15 @@ def adapter(settings, arguments):
     bypass = env.get("AI_FENCE_CODEX_DESKTOP", "1").lower() in OFF
     discovery = any(x in {"--version", "-V", "--help", "-h"} for x in arguments)
     native_commands = {"login", "logout", "completion", "migrate-rollouts", "features", "debug", "help"}
-    if bypass or discovery or command in native_commands or (tail and tail[0] in {"generate-ts", "generate-json-schema"}):
+    shared_auth = settings.get("auth_mode") == "native-owner"
+    if shared_auth and command != "app-server" and command not in native_commands and not discovery:
+        fail("shared native auth requires the desktop stdio app-server; use ordinary native Codex for TUI or select the profile as --auth-home")
+    # Native routing still needs the external-token bridge when history and
+    # credentials have separate owners. Direct exec would reuse stale profile auth.
+    direct_native = bypass and shared_auth and command == "app-server"
+    if (bypass and not direct_native) or discovery or command in native_commands or (tail and tail[0] in {"generate-ts", "generate-json-schema"}):
         # Keep CLI entry points in the selected history store as well.
-        env["CODEX_HOME"] = settings["state_home"]
+        env["CODEX_HOME"] = settings.get("auth_home", settings["state_home"]) if command in {"login", "logout"} else settings["state_home"]
         if bypass:
             arguments = ["-c", 'model_provider="openai"', *arguments]
         os.execve(settings["native_codex"], [settings["native_codex"], *arguments], env)
@@ -593,37 +860,65 @@ def adapter(settings, arguments):
     env["_AI_FENCE_DESKTOP_OWNED"] = "1"
     env["AI_FENCE_SNAPSHOTS"] = "off"
     env["AI_FENCE_CLI_AUTO_UPDATE"] = "never"
+    env["AI_FENCE_WORKSPACE_HOME"] = str(named_registry(settings))
     cli = cli_payload(settings)
-    seed_auth(settings)
+    if settings.get("auth_mode") != "native-owner":
+        seed_auth(settings)
     argv = [str(cli), "run", "--no-codex-config", "--standalone", "--localsubscription", "--agent", "codex",
             "--profile", settings["profile"], "--codex-home", settings["state_home"],
             "--codex-auth-source", "managed", "--", str(cli.parent / "codex-runtime"), *arguments]
+    if direct_native:
+        argv = [settings["native_codex"], "-c", 'model_provider="openai"',
+                "-c", 'cli_auth_credentials_store="ephemeral"', *arguments]
     lease = dict(pid=os.getpid(), start=process_identity(os.getpid()))
     live = root / "launches" / (str(os.getpid()) + ".json")
     save(live, dict(format=FORMAT, **lease, child_pid=None, profile=settings["profile"],
                     state_home=settings["state_home"], logical_cwd=os.environ.get("PWD", os.getcwd()),
-                    physical_cwd=str(Path.cwd().resolve()), mode="checkpoint", endpoint=None, release=settings["release"]))
+                    physical_cwd=str(Path.cwd().resolve()), fenced=not direct_native,
+                    mode="native-stdio" if direct_native else "desktop-stdio" if command == "app-server" else "cli",
+                    snapshot_policy=env["_AI_FENCE_DESKTOP_CHECKPOINT_POLICY"], endpoint=None, release=settings["release"],
+                    cli_version=settings.get("cli_version", "unknown"), cli_sha256=settings.get("cli_sha256")))
     env["_AI_FENCE_DESKTOP_LAUNCH"] = str(live)
     interactive = command != "app-server"
+    lifecycle = Lifecycle(settings, lease)
     if interactive and command == "resume" and tail and re.fullmatch(r"[a-fA-F0-9-]{36}", tail[0]):
         parameters = dict(threadId=tail[0])
         preflight_resume(settings, parameters)
         if parameters.get("cwd"):
             argv = argv[:argv.index("--") + 2] + ["-C", parameters["cwd"], *arguments]
-            attach(settings, tail[0], parameters["cwd"], lease)
-    child = subprocess.Popen(argv, env=env, stdin=None if interactive else subprocess.PIPE,
-                             stdout=None if interactive else subprocess.PIPE,
-                             start_new_session=True, bufsize=0)
+            named = lifecycle.reserve(parameters["cwd"], tail[0])
+            attach(settings, tail[0], parameters["cwd"], lease, named=named)
+    if interactive:
+        cwd = parameters["cwd"] if command == "resume" and tail and re.fullmatch(r"[a-fA-F0-9-]{36}", tail[0]) and parameters.get("cwd") else native_cwd(arguments)
+        selected = lifecycle.reserve(cwd)
+        if selected:
+            lifecycle.startup.add(selected["id"])
+            env["AI_FENCE_WORKSPACE_LEASE"] = selected["lease"]
+            env["AI_FENCE_WORKSPACE_HOME"] = selected["registry"]
+    try:
+        child = subprocess.Popen(argv, env=env, stdin=None if interactive else subprocess.PIPE,
+                                 stdout=None if interactive else subprocess.PIPE,
+                                 start_new_session=True, bufsize=0)
+    except BaseException:
+        lifecycle.close()
+        live.unlink(missing_ok=True)
+        raise
+    lifecycle.child_pid = child.pid
     with lock(live.with_suffix(".lock")):
         item = load(live)
         item["child_pid"] = child.pid
         save(live, item)
-    lifecycle = Lifecycle(settings, lease)
     output_lock = threading.Lock()
     def send(value):
         with output_lock:
             sys.stdout.buffer.write(json.dumps(value, separators=(",", ":")).encode() + b"\n")
             sys.stdout.buffer.flush()
+    native_lock = threading.Lock()
+    def native_send(value):
+        with native_lock:
+            child.stdin.write(json.dumps(value, separators=(",", ":")).encode() + b"\n")
+            child.stdin.flush()
+    auth_bridge = auth_runtime.Bridge(settings, native_send, send) if settings.get("auth_mode") == "native-owner" else None
     def input_loop():
         reader = selectors.DefaultSelector()
         reader.register(sys.stdin.fileno(), selectors.EVENT_READ)
@@ -640,13 +935,28 @@ def adapter(settings, arguments):
                     line, pending = pending.split(b"\n", 1)
                     value = json.loads(line)
                     try:
+                        if auth_bridge:
+                            if value.get("method") == "initialize":
+                                auth_runtime.initialize(settings, value)
+                            if auth_bridge.client(value):
+                                continue
+                            if value.get("method") == "turn/start" and not auth_bridge.sync():
+                                raise auth_runtime.AuthError()
                         lifecycle.request(value)
-                    except (RuntimeError, OSError, ValueError):
-                        send({"jsonrpc": "2.0", "id": value.get("id"), "error": {
-                            "code": -32602, "message": "AI Fence saved workspace unavailable or changed; explicit recovery/adoption required"}})
+                    except auth_runtime.AuthError as error:
+                        send(auth_bridge.error(value.get("id"), error))
                         continue
-                    child.stdin.write(json.dumps(value, separators=(",", ":")).encode() + b"\n")
-                    child.stdin.flush()
+                    except (RuntimeError, OSError, ValueError) as error:
+                        send({"jsonrpc": "2.0", "id": value.get("id"), "error": {
+                            "code": -32602, "message": "AI Fence workspace preflight: " + str(error)[:500],
+                            "data": {"origin":"ai_fence", "stage":"workspace_preflight", "retryable":False, "native_forwarded":False}}})
+                        continue
+                    native_send(value)
+                    if auth_bridge and value.get("method") == "initialized":
+                        try:
+                            auth_bridge.sync()
+                        except auth_runtime.AuthError as error:
+                            send(auth_bridge.error(None, error))
         except (BrokenPipeError, OSError, ValueError):
             pass
         finally:
@@ -676,6 +986,7 @@ def adapter(settings, arguments):
                 os.killpg(child.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            lifecycle.close()
             live.unlink(missing_ok=True)
     selector = selectors.DefaultSelector()
     selector.register(child.stdout, selectors.EVENT_READ)
@@ -697,15 +1008,20 @@ def adapter(settings, arguments):
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
                 value = json.loads(line)
+                if auth_bridge and auth_bridge.runtime(value):
+                    continue
                 try:
-                    lifecycle.response(value)
+                    forward = lifecycle.response(value)
                 except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
                     print("ai-fence codex: thread workspace registration/checkpoint failed", file=sys.stderr)
                     stop(signal.SIGTERM, None)
                     break
-                send(value)
+                if forward:
+                    send(value)
         status = child.wait(timeout=5)
     finally:
+        if auth_bridge:
+            auth_bridge.close()
         selector.close()
         try:
             os.killpg(child.pid, signal.SIGTERM)
@@ -716,6 +1032,7 @@ def adapter(settings, arguments):
         except subprocess.TimeoutExpired:
             os.killpg(child.pid, signal.SIGKILL)
             child.wait()
+        lifecycle.close()
         live.unlink(missing_ok=True)
     return status if status >= 0 else 128 - status
 
@@ -744,17 +1061,34 @@ def doctor(settings, args):
         with (home / "config.toml").open("rb") as stream:
             native_config = tomllib.load(stream)
     sqlite_home = native_config.get("sqlite_home", os.environ.get("CODEX_SQLITE_HOME", str(home)))
+    named = named_context(settings, Path.cwd())
     report = dict(format=FORMAT, profile=settings["profile"], state_home=str(home),
+                  auth_home=settings.get("auth_home", str(home)), auth_mode=settings.get("auth_mode", "profile"),
+                  credential_probe="not performed; transport/history availability does not prove provider authentication",
+                  installed_cli_version=settings.get("cli_version", "unknown"), installed_cli_sha256=settings.get("cli_sha256"),
+                  update_policy=settings.get("update_policy", "off"),
+                  running_older_release=any(item["alive"] and item.get("release") != settings["release"] for item in launches),
                   native_path=settings["native_codex"], native_version=settings["native_version"],
                   native_unchanged=Path(settings["native_codex"]).is_file() and digest(settings["native_codex"]) == settings["native_sha256"],
                   owned_files=files, launches=launches, logical_cwd=os.environ.get("PWD", os.getcwd()),
-                  physical_cwd=str(Path.cwd().resolve()), mode="checkpoint", snapshot_policy=settings["snapshot_policy"],
+                  physical_cwd=str(Path.cwd().resolve()), mode="named" if named else "original",
+                  snapshot_policy=os.environ.get("AI_FENCE_SNAPSHOTS", settings["snapshot_policy"]),
+                  workspace_registry=str(named_registry(settings)), named_workspace=named,
                   sessions_present=(home / "sessions").is_dir(),
                   resume="resume --all removes cwd filtering only within this CODEX_HOME; provider/account filters are separate",
                   sqlite_home=str(Path(sqlite_home).expanduser().resolve()),
                   saved_provider=native_config.get("model_provider", "openai"),
                   effective_fenced_provider="ai_fence (process override)",
                   active_native_configuration="per-launch overrides; owning endpoint is recorded separately")
+    update_receipt = root / "update-status.json"
+    if update_receipt.exists():
+        report["update_status"] = json.loads(update_receipt.read_text())
+    if getattr(args, "check_auth", False):
+        version = settings.get("native_version", "codex-cli 0").removeprefix("codex-cli ")
+        if not re.fullmatch(r"[0-9.]+", version):
+            fail("cannot identify native client version for the provider check")
+        auth_settings = dict(settings, auth_home=settings.get("auth_home", str(home)))
+        report["provider_authentication"] = auth_runtime.provider_check(auth_settings, version)
     if args.endpoint:
         target = endpoint(args.endpoint)
         try:
@@ -769,11 +1103,24 @@ def doctor(settings, args):
         report["thread_registration"] = load(path) if path.exists() else None
         report["native_thread"] = native_thread(settings, args.thread_id)
         report["absence_checks"] = ["selected CODEX_HOME", "provider/account selection", "cwd/physical alias filter", "archived status"]
+        reference = (report["thread_registration"] or {}).get("named_workspace")
+        registry = Path(reference["registry"]) if reference else named_registry(settings)
+        if (registry / "records").exists():
+            try:
+                report["named_thread_workspace"] = named_call(settings, "_resolve", "--thread-id", args.thread_id,
+                    "--profile", settings["profile"], "--state-home", settings["state_home"], registry=registry)
+            except (RuntimeError, OSError, ValueError):
+                report["named_thread_workspace_error"] = "saved named workspace is missing, removed or changed; recover explicitly"
     report["healthy"] = all(files.values()) and report["native_unchanged"] and all(
-        not v["alive"] or (v.get("listener_owned", False) and v.get("endpoint_tcp_alive", False)) for v in launches)
+        not v["alive"] or v.get("mode") == "native-stdio" and v.get("fenced") is False
+        or (v.get("listener_owned", False) and v.get("endpoint_tcp_alive", False)) for v in launches)
     if args.endpoint:
         report["healthy"] = report["healthy"] and report["endpoint_tcp_alive"]
+    if "provider_authentication" in report:
+        report["healthy"] = report["healthy"] and report["provider_authentication"]["authenticated"]
     if args.thread_id:
+        if report.get("named_thread_workspace_error"):
+            report["healthy"] = False
         thread = report.get("native_thread")
         report["resume_diagnosis"] = []
         if thread is None:
@@ -885,116 +1232,26 @@ def native_thread(settings, thread_id):
         child.stdout.close()
 
 
-def git_independent(root):
-    root = Path(root).resolve(strict=True)
-    if not (root / ".git").exists():
-        return True
-    if (root / ".git").is_symlink() or not (root / ".git").is_dir():
-        return False
-    for relative in ["--git-dir", "--git-common-dir", "--show-toplevel"]:
-        result = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", relative],
-                                capture_output=True, timeout=5)
-        if result.returncode or not Path(os.fsdecode(result.stdout).strip()).resolve().is_relative_to(root):
-            return False
-    if any((root / ".git").rglob("alternates")):
-        return False
-    # Nested Git metadata (submodules/worktrees) needs deliberate relocation.
-    for parent, directories, files in os.walk(root, followlinks=False):
-        if Path(parent) == root:
-            directories[:] = [d for d in directories if d != ".git"]
-        elif ".git" in directories or ".git" in files:
-            return False
-    return True
-
-
 def workspace_control(settings, args):
-    path = record_path(settings, args.thread_id) if getattr(args, "thread_id", None) else None
-    if args.workspace_action == "cleanup":
-        records = sorted((Path(settings["state_home"]) / "ai-fence-workspaces").glob("*.json"))
-        items = []
-        for p in records[:args.limit]:
-            r = load(p)
-            items.append(dict(thread_id=r["thread_id"], workspace=r["workspace"]["physical"],
-                              protected="chat-linked", active=any(alive(v) for v in r["leases"]), pinned=r["pinned"]))
-        print(json.dumps(dict(preview=True, workspaces=items, truncated=len(records) > args.limit,
-                              note="No linked, active, dirty, pinned or unowned workspace is eligible. No workspace deletion is performed."), indent=2))
-        return
-    with lock(path.with_suffix(".lock")):
-        existing = load(path) if path.exists() else None
-        if existing and any(alive(v) for v in existing["leases"]):
-            fail("workspace has an active lease; adoption/recovery cannot change it")
-        thread = native_thread(settings, args.thread_id)
-        if not thread or not thread.get("cwd"):
-            fail("thread absent from selected CODEX_HOME; inspect the original state store before adoption")
-        source = args.project.expanduser().resolve(strict=args.workspace_action != "recover")
-        if args.workspace_action != "recover" and identity(thread["cwd"]) != identity(source):
-            fail("native thread belongs to another project; adoption cannot rewrite historical cwd or account/provider metadata")
-        project = existing["project"] if existing else identity(source)
-        destination = source
-        receipt = None
-        if args.workspace_action == "create":
-            if not any(Path(p).resolve() == source for p in settings["roots"]):
-                fail("writable isolation requires explicit --approve-root in setup")
-            args.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            destination = args.directory.resolve() / args.thread_id
-            if existing and existing["mode"] == "isolated":
-                if not Path(existing["workspace"]["physical"]).exists() or identity(existing["workspace"]["physical"]) != existing["workspace"]:
-                    fail("saved workspace is missing or replaced; explicit recovery is required")
-                print(json.dumps(dict(reused=True, workspace=existing["workspace"]["physical"])))
-                return
-            if destination.exists():
-                fail("unregistered destination exists; adopt explicitly instead of replacing files")
-            cli = cli_payload(settings)
-            inventory = subprocess.run([str(cli), "snapshot", "inspect", "--root", str(source),
-                                        "--directory", str(args.directory.resolve()), "--recursive"],
-                                       capture_output=True, timeout=15, check=True)
-            scope = json.loads(inventory.stdout)
-            if scope["nested"]:
-                fail("nested subvolumes require coordinated reconstruction; writable cloning is unavailable for this project")
-            if not git_independent(source):
-                fail("external/shared Git metadata is not isolated; use native Git worktrees or an explicit shared workspace")
-        elif args.workspace_action == "recover":
-            manifest = json.loads(args.checkpoint.read_text())
-            if not manifest.get("complete") or not manifest.get("read_only") or len(manifest.get("members", [])) != 1:
-                fail("recovery requires a complete single-member read-only checkpoint; reconstruct nested sets explicitly")
-            if Path(manifest["root"]).resolve() != source:
-                fail("checkpoint project identity does not match the selected project")
-            receipt = dict(id=manifest["id"], path=manifest["path"])
-            snapshot = Path(manifest["path"]) / manifest["members"][0]["snapshot_name"]
-            if snapshot.parent.resolve() != args.checkpoint.parent.resolve() or not git_independent(snapshot):
-                fail("checkpoint location or Git independence cannot be verified")
-            if identity(snapshot)["subvolume_uuid"] != manifest["members"][0]["snapshot_uuid"]:
-                fail("checkpoint subvolume identity changed")
-            readonly = subprocess.run(["btrfs", "property", "get", "-ts", str(snapshot), "ro"], capture_output=True, timeout=5, check=True)
-            if readonly.stdout.strip() != b"ro=true":
-                fail("chosen checkpoint is no longer read-only")
-            source = snapshot
-            args.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            destination = args.directory.resolve() / (args.thread_id + "-recovered-" + manifest["id"])
-            if destination.exists():
-                fail("recovery destination already exists; no replacement performed")
-        elif args.workspace_action == "adopt" and args.workspace:
-            destination = args.workspace.expanduser().resolve(strict=True)
-        plan = dict(preview=not args.apply, thread_id=args.thread_id, project=project,
-                    source=str(source), workspace=str(destination),
-                    preserve_current=existing["workspace"] if existing else identity(args.project),
-                    mode="isolated" if args.workspace_action in {"create", "recover"} else "shared")
-        print(json.dumps(plan, indent=2))
-        if not args.apply:
-            return
-        if args.workspace_action in {"create", "recover"}:
-            subprocess.run(["btrfs", "subvolume", "snapshot", str(source), str(destination)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=True)
-            if not git_independent(destination):
-                fail("created workspace failed Git independence verification; preserved for inspection, not registered")
-        if existing:
-            save(path.with_name(path.stem + ".previous.json"), existing)
-        record = dict(format=FORMAT, thread_id=args.thread_id, profile=settings["profile"],
-                      state_home=settings["state_home"], project=project, logical_root=str(args.project),
-                      workspace=identity(destination), mode=plan["mode"],
-                      checkpoints=(existing["checkpoints"] if existing else []) + ([receipt] if receipt else []),
-                      leases=[], pinned=existing["pinned"] if existing else False)
-        save(path, record)
+    """The desktop entry point uses the same named workspace CLI as shells."""
+    env = os.environ.copy()
+    env["AI_FENCE_WORKSPACE_HOME"] = str(named_registry(settings))
+    env["AI_FENCE_CLI_AUTO_UPDATE"] = "never"
+    return subprocess.call([str(cli_payload(settings)), "workspace", *args.arguments], env=env)
+
+
+def discovery_router(settings, prefix):
+    """Optional default-command router; no desktop-version-specific signature."""
+    if prefix:
+        trusted(Path(prefix[0]), True)
+    import inspect
+    parser = inspect.getsource(subcommand)
+    return ("#!/usr/bin/env python3\n# AI_FENCE_CODEX_DESKTOP_ROUTER=1\nimport os,sys,json\nfrom pathlib import Path\n"
+            + parser + "\nroot=Path(" + repr(settings["install_root"]) + ")\n"
+            + "settings=json.loads((root/'settings.json').read_text())\n"
+            + "arguments=sys.argv[1:]\ncommand,_=subcommand(arguments)\n"
+            + "target=str(root/'bin/codex') if command=='app-server' else settings['native_codex']\n"
+            + "launch=" + repr(list(prefix)) + "+[target]+arguments\nos.execv(launch[0],launch)\n")
 
 
 def control(arguments):
@@ -1005,35 +1262,46 @@ def control(arguments):
     setup.add_argument("--native-codex", required=True, type=Path)
     setup.add_argument("--state-home", required=True, type=Path, help="explicit stable Codex state store; never a run directory")
     setup.add_argument("--readiness-seconds", type=int, choices=range(0, 121), default=45, help="bounded passive wait for configured native/state storage")
-    setup.add_argument("--seed-home", type=Path, help="optional same-account native auth seed; existing managed auth wins")
+    setup.add_argument("--auth-home", "--seed-home", dest="auth_home", type=Path,
+                       help="single native ChatGPT credential owner; defaults to native CODEX_HOME on a fresh setup, retained on upgrade; select --state-home's path for profile auth")
+    setup.add_argument("--updates", choices=["auto", "manual", "off"], help="verified CLI updates on future app-server launches (default auto); active sessions are retained")
+    setup.add_argument("--update-base-url", help="trusted HTTPS AI Fence release server, default https://ai.yml.world")
+    setup.add_argument("--update-interval-seconds", type=int, choices=range(60, 604801), help="successful update-check interval, default 86400; failures back off 300 seconds")
+    setup.add_argument("--prepare-only", type=Path, help=argparse.SUPPRESS)
+    setup.add_argument("--launch-prefix", nargs=argparse.REMAINDER,
+                       help="existing memory/admission launcher and arguments; supply LAST; retained on upgrades and applied before adapter startup")
     setup.add_argument("--profile", default=os.environ.get("AI_FENCE_CODEX_PROFILE", os.environ.get("AI_FENCE_PROFILE", "default")))
-    setup.add_argument("--snapshots", choices=["auto", "off", "required"], default="auto")
+    setup.add_argument("--snapshots", choices=["auto", "off", "required"], default="off")
+    setup.add_argument("--workspace-registry", type=Path, help="shared named workspace metadata; defaults to AI_FENCE_WORKSPACE_HOME or ~/.ai-fence/workspace-registry")
     setup.add_argument("--approve-root", type=Path, action="append", default=[])
     setup.add_argument("--snapshot-directory", type=Path)
     status = commands.add_parser("doctor", aliases=["status"])
     status.add_argument("--strict", action="store_true", help="exit nonzero on unhealthy file/route metadata")
     status.add_argument("--endpoint")
     status.add_argument("--thread-id")
+    status.add_argument("--check-auth", action="store_true", help="explicit read-only ChatGPT models request; no refresh, inference, or response content is logged")
     remove = commands.add_parser("uninstall")
     remove.add_argument("--apply", action="store_true")
-    workspace = commands.add_parser("workspace", help="preview adoption, persistent isolation or recovery")
-    actions = workspace.add_subparsers(dest="workspace_action", required=True)
-    for name in ["adopt", "create", "recover"]:
-        action = actions.add_parser(name)
-        action.add_argument("--thread-id", required=True)
-        action.add_argument("--project", type=Path, required=True)
-        action.add_argument("--apply", action="store_true")
-        if name == "adopt":
-            action.add_argument("--workspace", type=Path)
-        else:
-            action.add_argument("--directory", type=Path, required=True)
-        if name == "recover":
-            action.add_argument("--checkpoint", type=Path, required=True, help="chosen checkpoint manifest.json")
-    cleanup = actions.add_parser("cleanup")
-    cleanup.add_argument("--limit", type=int, choices=range(1, 101), default=32)
+    workspace = commands.add_parser("workspace", help="shared named workspace commands", add_help=False)
+    workspace.add_argument("arguments", nargs=argparse.REMAINDER)
     commands.add_parser("rollback", help="select previous installed release; does not restore history or workspaces")
     commands.add_parser("windows-launcher", help="print the packaged session-only Windows launcher")
-    args = parser.parse_args(arguments)
+    update = commands.add_parser("update", help="check/install a verified CLI release for future connections; never restart active chats")
+    update.add_argument("--check-only", action="store_true")
+    router = commands.add_parser("discovery-router", help="print an optional router: all app-server invocations use this profile; ordinary native CLI remains native")
+    router.add_argument("--launch-prefix", nargs=argparse.REMAINDER, default=[],
+                        help="optional existing memory/admission launcher prefix, applied to BOTH routes")
+    # argparse treats a literal -- specially even inside an optional REMAINDER.
+    # A launcher prefix is LAST and must retain that delimiter byte-for-byte.
+    args = None
+    if "--launch-prefix" in arguments:
+        marker = arguments.index("--launch-prefix")
+        selected = parser.parse_args(arguments[:marker])
+        if selected.command in {"setup", "discovery-router"}:
+            selected.launch_prefix = arguments[marker + 1:]
+            args = selected
+    if args is None:
+        args = parser.parse_args(arguments)
     if args.command == "setup":
         install(args)
         return 0
@@ -1045,7 +1313,15 @@ def control(arguments):
         healthy = doctor(settings, args)
         return 0 if healthy or not args.strict else 1
     elif args.command == "workspace":
-        workspace_control(settings, args)
+        return workspace_control(settings, args)
+    elif args.command == "update":
+        if not args.check_only:
+            wait_for_payloads(settings)
+        result = updates.check(settings, force=True, check_only=args.check_only)
+        print(json.dumps(result))
+        return 1 if result["status"] == "failed" else 0
+    elif args.command == "discovery-router":
+        print(discovery_router(settings, args.launch_prefix), end="")
     elif args.command == "uninstall":
         uninstall(settings, args.apply)
     elif args.command == "rollback":
@@ -1058,6 +1334,7 @@ def control(arguments):
                 if not (root / name).is_file() or digest(root / name) != expected:
                     fail("previous release integrity check failed; rollback was not applied")
             save(root / "snapshot-roots.json", dict(format=FORMAT, roots=previous["roots"]))
+            previous["update_policy"] = "manual"
             save(root / "settings.json", previous)
             save(root / "previous-settings.json", settings)
         print(json.dumps({"release": previous["release"], "restart_required": "only the affected connection, when ready"}))
@@ -1070,6 +1347,15 @@ def main():
         return control(arguments)
     settings = settings_for_runtime()
     if mode == "adapter":
+        wait_for_payloads(settings)
+        if (os.environ.get("AI_FENCE_CODEX_DESKTOP", "1").lower() not in OFF and
+                subcommand(arguments)[0] == "app-server" and not any(arg in {"--help", "-h", "--version", "-V"} for arg in arguments)):
+            result = updates.check(settings)
+            if result["status"] == "installed":
+                selected = load(Path(settings["install_root"]) / "settings.json")
+                os.environ["_AI_FENCE_DESKTOP_SETTINGS"] = json.dumps(selected)
+                script = cli_payload(selected).with_name("runtime.py")
+                os.execv(sys.executable, [sys.executable, str(script), mode, *arguments])
         with lock(Path(settings["install_root"]) / ".lifecycle.lock", shared=True):
             if not (Path(settings["install_root"]) / "settings.json").exists():
                 fail("integration was uninstalled before this launch; use native Codex or rerun setup")
