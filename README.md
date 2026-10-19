@@ -41,7 +41,7 @@ identity and leases; read-only checkpoints are separately opt-in.
 ## Codex desktop updates (v0.1.9)
 
 Verified updates request older managed desktop connections to reconnect when
-idle by default. Normal terminal automatic-update checks also service registered
+idle by default. Linux/WSL terminal automatic-update checks also service registered
 desktop installations on the same release server and channel. Setup and new
 desktop launches register their existing profile/state-home identities; missing
 stores are never recreated and different accounts are never merged.
