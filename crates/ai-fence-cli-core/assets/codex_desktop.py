@@ -175,6 +175,103 @@ def profile_name(value):
     return value
 
 
+def reconnect_enabled(settings, explicit=None):
+    if explicit is not None:
+        return explicit
+    value = os.environ.get("AI_FENCE_CODEX_RECONNECT", settings.get("reconnect_policy", "auto")).lower()
+    if value not in OFF | {"1", "on", "true", "yes", "auto"}:
+        fail("AI_FENCE_CODEX_RECONNECT must be auto/on or off")
+    return value not in OFF
+
+
+def installation_registry():
+    channel = os.environ.get("AI_FENCE_CLI_CHANNEL", os.environ.get("AI_FENCE_STAGE", "")).strip().lower()
+    suffix = "" if channel in {"", "prod"} else "-" + re.sub(r"[^a-z0-9._-]", "_", channel)
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / ("ai-fence" + suffix) / "codex-desktop-installs.json"
+
+
+def register_installation(settings):
+    root = Path(settings["install_root"]).resolve(strict=True)
+    trusted(root / "settings.json")
+    registry = installation_registry()
+    with lock(registry.with_suffix(".lock")):
+        record = load(registry) if registry.exists() else dict(format=FORMAT, installations=[])
+        entry = dict(install_root=str(root), identity=identity(root), profile=settings["profile"], state_home=settings["state_home"])
+        entries = [v for v in record["installations"] if v["install_root"] != str(root)] + [entry]
+        entries.sort(key=lambda v: v["install_root"])
+        updated = dict(format=FORMAT, installations=entries)
+        if updated != record:
+            save(registry, updated)
+
+
+def unregister_installation(settings):
+    registry = installation_registry()
+    if registry.exists():
+        with lock(registry.with_suffix(".lock")):
+            record = load(registry)
+            record["installations"] = [v for v in record["installations"] if v["install_root"] != settings["install_root"]]
+            save(registry, record)
+
+
+def reconnect_after_update(settings, result, explicit=None):
+    if not reconnect_enabled(settings, explicit):
+        return dict(status="disabled")
+    accepted = result["status"] in {"installed", "current"}
+    if result["status"] == "deferred":
+        path = Path(settings["install_root"]) / "update-status.json"
+        accepted = path.exists() and json.loads(path.read_text()).get("status") in {"installed", "current"}
+    if not accepted:
+        return dict(status="not_scheduled", update_status=result["status"])
+    selected = load(Path(settings["install_root"]) / "settings.json")
+    return reconnect(selected, apply=True, older_only=True, automatic=explicit is not True)
+
+
+def update_registered(source_base_url):
+    """Terminal update hook; registered paths only, no history/home discovery."""
+    updates.safe_url(source_base_url)
+    registry = installation_registry()
+    if not registry.exists():
+        return dict(status="none", installations=[])
+    with lock(registry.with_suffix(".lock")):
+        entries = load(registry)["installations"]
+    source = trusted(os.environ["AI_FENCE_DESKTOP_CLI_SOURCE"], True)
+    probe = subprocess.run([str(source), "--version"], capture_output=True, timeout=10,
+                           env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+    source_version = probe.stdout.decode().strip().removeprefix("ai-fence-cli ")
+    if probe.returncode:
+        fail("cannot identify the terminal CLI release")
+    updates.version(source_version)
+    results = []
+    for entry in entries:
+        root = Path(entry["install_root"])
+        try:
+            if not root.is_dir() or identity(root) != entry["identity"] or not (root / "settings.json").is_file():
+                results.append(dict(install_root=str(root), status="missing_or_replaced"))
+                continue
+            trusted(root / "settings.json")
+            settings = load(root / "settings.json")
+            if any(settings.get(k) != entry[k] for k in ["install_root", "profile", "state_home"]):
+                fail("registered installation identity changed")
+            if (settings.get("update_policy", "off") != "auto"
+                    or settings.get("update_base_url", "https://ai.yml.world").rstrip("/") != source_base_url.rstrip("/")):
+                results.append(dict(install_root=str(root), status="disabled_or_other_source"))
+                continue
+            newer = updates.version(source_version) > updates.version(settings.get("cli_version", "unknown"))
+            result = updates.check(settings, force=newer)
+            result["reconnect"] = reconnect_after_update(settings, result)
+            results.append(dict(install_root=str(root), **result))
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError):
+            results.append(dict(install_root=str(root), status="failed"))
+    outcomes = {v.get("reconnect", {}).get("status") for v in results}
+    if "scheduled" in outcomes:
+        print("ai-fence codex: updated desktop connections will reconnect when idle; reopen their saved chats", file=sys.stderr)
+    if "manual_reconnect_required" in outcomes:
+        print("ai-fence codex: reconnect older adapters manually once to enable automatic reconnects", file=sys.stderr)
+    if any(v["status"] == "failed" for v in results):
+        print("ai-fence codex: an automatic desktop update was deferred; inspect codex-desktop doctor", file=sys.stderr)
+    return dict(status="checked", installations=results)
+
+
 def install(args):
     if sys.platform != "linux" or sys.version_info < (3, 11):
         fail("native desktop setup currently requires Linux/WSL and Python 3.11+")
@@ -313,6 +410,7 @@ def install(args):
                         snapshot_directory=str(args.snapshot_directory.expanduser().absolute()) if args.snapshot_directory else None,
                         files=files, launch_prefix=launch_prefix, cli_version=cli_version, cli_sha256=digest(cli),
                         update_policy=getattr(args, "updates", None) or (old or {}).get("update_policy", "auto"),
+                        reconnect_policy=getattr(args, "reconnect", None) or (old or {}).get("reconnect_policy", "auto"),
                         update_base_url=getattr(args, "update_base_url", None) or (old or {}).get("update_base_url", "https://ai.yml.world"),
                         update_interval_seconds=getattr(args, "update_interval_seconds", None) or (old or {}).get("update_interval_seconds", 86400), **auth)
         updates.safe_url(settings["update_base_url"])
@@ -325,6 +423,11 @@ def install(args):
             install_guidance(home)
         # This is the only release switch; existing children retain old settings.
         save(destination / "settings.json", settings)
+        if not prepared:
+            try:
+                register_installation(settings)
+            except (OSError, ValueError, RuntimeError):
+                print("ai-fence codex: terminal update registration deferred; run codex-desktop register when available", file=sys.stderr)
         print(json.dumps({"installed": True, "adapter": str(root / "bin/codex"),
                           "profile": settings["profile"], "state_home": str(home),
                           "native_version": version, "release": release_id,
@@ -757,7 +860,8 @@ class Lifecycle:
                 requested = capabilities.get("optOutNotificationMethods")
                 if isinstance(requested, list):
                     self.opt_out = {item for item in requested if isinstance(item, str)}
-                    observed = {"thread/started", "thread/closed", "thread/status/changed"}
+                    observed = {"thread/started", "thread/closed", "thread/status/changed",
+                                "turn/started", "turn/completed"}
                     capabilities["optOutNotificationMethods"] = [item for item in requested if item not in observed]
         resumed = method in {"thread/resume", "turn/start", "thread/shellCommand"}
         if resumed:
@@ -821,6 +925,258 @@ class Lifecycle:
         return value.get("method") not in self.opt_out
 
 
+def settings_fingerprint(settings):
+    return hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+
+
+def reconnect_report(root, operation_id):
+    if not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+        fail("invalid reconnect operation identity")
+    return root / "reconnects" / (operation_id + ".json")
+
+
+def verify_reconnect_install(settings):
+    root = Path(settings["install_root"])
+    for name, expected in settings["files"].items():
+        path = Path(name)
+        if path.is_absolute() or ".." in path.parts or (root / path).is_symlink() or digest(root / path) != expected:
+            fail("installed release integrity failed; reconnect was not requested")
+    if settings.get("native_sha256") and digest(settings["native_codex"]) != settings["native_sha256"]:
+        fail("native Codex changed; rerun setup before reconnecting")
+
+
+def reconnect(settings, apply=False, status=False, cancel=False, pid=None, wait_seconds=60, older_only=False, automatic=False):
+    """Arm one atomic, installation-scoped request; each adapter stops itself.
+
+    No PID signals, timers, worker processes, credentials or native RPC injection.
+    The existing adapter loop owns the idle boundary and shutdown lifecycle.
+    """
+    root = Path(settings["install_root"])
+    request_path = root / "reconnect-request.json"
+    with lock(root / ".reconnect.lock", blocking=False):
+        previous = load(request_path) if request_path.exists() else None
+        if status or cancel:
+            if not previous:
+                return dict(status="none", targets=[], reopen_thread_ids=[])
+            report_path = reconnect_report(root, previous["operation_id"])
+            if cancel:
+                previous["cancelled"] = True
+                save(request_path, previous)
+            with lock(report_path.with_suffix(".lock")):
+                report = load(report_path)
+                for target in report["targets"]:
+                    if target["status"] == "pending":
+                        if previous.get("cancelled"):
+                            target["status"] = "cancelled"
+                        elif previous["expires_at"] <= time.time():
+                            target["status"] = "expired"
+                        elif not alive(target):
+                            target["status"] = "disconnected"
+                if cancel:
+                    save(report_path, report)
+            report["reopen_thread_ids"] = sorted({thread for target in report["targets"] for thread in target.get("threads", [])})
+            report["reopen_chats"] = "Reopen saved chats in Codex; restoring desktop tabs is controlled by the desktop client."
+            states = {target["status"] for target in report["targets"]}
+            report["status"] = "closed" if states == {"closed"} else "pending" if "pending" in states else "shutting_down" if "shutting_down" in states else "finished"
+            report["replacement_launches"] = []
+            for path in (root / "launches").glob("*.json"):
+                item = load(path)
+                if (not alive(item) or item.get("mode") != "desktop-stdio" or not item.get("fenced")
+                        or item.get("started_at", 0) < previous["created_at"]
+                        or item.get("release") != report["selected_release"]
+                        or item.get("profile") != report["profile"] or item.get("state_home") != report["state_home"]):
+                    continue
+                proxy = item.get("proxy_pid")
+                try:
+                    verified = (process_identity(proxy) == item.get("proxy_start")
+                                and digest(Path(f"/proc/{proxy}/exe")) == report["selected_cli_sha256"]
+                                and listener_owned(proxy, endpoint(item["endpoint"]).port))
+                except (OSError, RuntimeError, ValueError, KeyError):
+                    verified = False
+                report["replacement_launches"].append(dict(pid=item["pid"], proxy_pid=proxy,
+                                                          cli_version=item.get("cli_version"), verified=verified))
+            return report
+        targets = []
+        for path in sorted((root / "launches").glob("*.json")):
+            item = load(path)
+            if (not alive(item) or item.get("mode") != "desktop-stdio" or not item.get("fenced")
+                    or item.get("profile") != settings["profile"] or item.get("state_home") != settings["state_home"]
+                    or (pid is not None and item["pid"] != pid)
+                    or (older_only and item.get("release") == settings["release"])):
+                continue
+            targets.append(dict(pid=item["pid"], start=item["start"], release=item.get("release"),
+                                status="pending" if item.get("reconnect_control") == 1 else "manual_reconnect_required",
+                                threads=item.get("reconnect_state", {}).get("threads", []),
+                                activity=item.get("reconnect_state", {})))
+        plan = dict(format=FORMAT, status="preview", profile=settings["profile"], state_home=settings["state_home"],
+                    selected_release=settings["release"], selected_cli_sha256=settings.get("cli_sha256"), targets=targets)
+        if not apply or not targets:
+            return plan
+        if any(item["status"] == "manual_reconnect_required" for item in targets):
+            return dict(plan, status="manual_reconnect_required",
+                        action="Reconnect older adapters manually once to enable cooperative reconnects; no process was signalled.")
+        if previous and not previous.get("cancelled") and previous["expires_at"] > time.time():
+            report = load(reconnect_report(root, previous["operation_id"]))
+            pending = [item for item in report["targets"] if item["status"] in {"pending", "shutting_down"} and alive(item)]
+            if pending:
+                if (previous["settings_fingerprint"] == settings_fingerprint(settings)
+                        and {(v["pid"], v["start"]) for v in previous["targets"]} == {(v["pid"], v["start"]) for v in targets}):
+                    return report
+                fail("a reconnect is already pending; inspect reconnect --status or cancel it first")
+        if not 1 <= wait_seconds <= 300:
+            fail("reconnect wait must be between 1 and 300 seconds")
+        with lock(root / ".install.lock", blocking=False):
+            if load(root / "settings.json") != settings:
+                fail("installation changed; preview reconnect again")
+            verify_reconnect_install(settings)
+            operation_id = uuid.uuid4().hex
+            request = dict(plan, status="scheduled", operation_id=operation_id, automatic=automatic,
+                           settings_fingerprint=settings_fingerprint(settings), created_at=time.time(), expires_at=time.time() + wait_seconds)
+            save(reconnect_report(root, operation_id), request)
+            # This sole atomic replacement arms the entire selected set. A new
+            # launch cannot be swept up by a process-name or endpoint search.
+            save(request_path, request)
+            return request
+
+
+class ReconnectSession:
+    """Observe protocol metadata and serialize an idle shutdown against input."""
+    def __init__(self, settings, live, lifecycle):
+        self.settings, self.live, self.lifecycle = settings, live, lifecycle
+        self.root, self.lease = Path(settings["install_root"]), load(live)
+        self.gate = threading.RLock()
+        self.pending, self.approvals, self.active, self.completed = {}, set(), set(), set()
+        self.inputs = 0
+        self.ready, self.draining = False, False
+        self.operation, self.terminal, self.reopen_threads = None, set(), []
+        self.published, self.error = None, None
+        self.publish()
+
+    def publish(self):
+        summary = dict(ready=self.ready, pending_requests=len(self.pending), pending_approvals=len(self.approvals),
+                       processing_inputs=self.inputs,
+                       active_turns=len(self.active | {thread for thread in self.pending.values() if thread}),
+                       threads=sorted(self.lifecycle.threads), draining=self.draining, error=self.error)
+        if summary != self.published:
+            with lock(self.live.with_suffix(".lock")):
+                item = load(self.live)
+                item.update(reconnect_control=1, reconnect_state=summary)
+                save(self.live, item)
+            self.published = summary
+
+    @contextlib.contextmanager
+    def input(self):
+        # Do not hold this gate while auth synchronously awaits native output.
+        # Count the entire input operation instead, including preflight/refresh.
+        with self.gate:
+            allowed = not self.draining
+            if allowed:
+                self.inputs += 1
+                self.publish()
+        try:
+            yield allowed
+        finally:
+            if allowed:
+                with self.gate:
+                    self.inputs -= 1
+                    self.publish()
+
+    def client(self, value):
+        if self.draining:
+            fail("connection is reconnecting; reopen the saved chat after reconnect")
+        method = value.get("method")
+        key = json.dumps(value.get("id"))
+        if method and "id" in value:
+            self.pending[key] = (value.get("params") or {}).get("threadId") if method == "turn/start" else None
+        elif not method and "id" in value:
+            self.approvals.discard(key)
+        if method == "initialized":
+            self.ready = True
+        self.publish()
+
+    def native(self, value):
+        method, params = value.get("method"), value.get("params") or {}
+        key = json.dumps(value.get("id"))
+        if method and "id" in value:
+            self.approvals.add(key)
+        elif not method and "id" in value:
+            thread = self.pending.pop(key, None)
+            turn = (value.get("result") or {}).get("turn") or {}
+            if thread and "error" not in value and turn.get("id") not in self.completed and turn.get("status") not in {"completed", "failed", "interrupted"}:
+                self.active.add(thread)
+        if method == "turn/started":
+            self.active.add(params.get("threadId"))
+        elif method == "turn/completed":
+            self.active.discard(params.get("threadId"))
+            self.completed.add((params.get("turn") or {}).get("id"))
+            if len(self.completed) > 256:
+                self.completed = {(params.get("turn") or {}).get("id")}
+        elif method in {"thread/closed", "thread/status/changed"}:
+            if method == "thread/closed" or params.get("status", {}).get("type") in {"notLoaded", "idle"}:
+                self.active.discard(params.get("threadId"))
+        self.publish()
+
+    def mark(self, status):
+        path = reconnect_report(self.root, self.operation)
+        with lock(path.with_suffix(".lock")):
+            report = load(path)
+            target = next(v for v in report["targets"] if v["pid"] == self.lease["pid"] and v["start"] == self.lease["start"])
+            target.update(status=status, threads=self.reopen_threads if self.draining else sorted(self.lifecycle.threads))
+            save(path, report)
+
+    def poll(self):
+        try:
+            return self.poll_checked()
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError, StopIteration):
+            # Malformed/stale local control metadata cannot take down a chat.
+            with self.gate:
+                self.draining = False
+                self.error = "reconnect_request_rejected"
+                try:
+                    self.publish()
+                except (OSError, ValueError, RuntimeError):
+                    pass
+            return False
+
+    def poll_checked(self):
+        with self.gate:
+            path = self.root / "reconnect-request.json"
+            if self.draining or not path.exists():
+                return False
+            request = load(path)
+            if request["operation_id"] in self.terminal:
+                return False
+            if not any(v["pid"] == self.lease["pid"] and v["start"] == self.lease["start"] for v in request["targets"]):
+                return False
+            self.operation = request["operation_id"]
+            reason = ("cancelled" if request.get("cancelled") else "expired" if request["expires_at"] <= time.time()
+                      else "disabled" if request.get("automatic") and not reconnect_enabled(load(self.root / "settings.json"))
+                      else "installation_changed" if settings_fingerprint(load(self.root / "settings.json")) != request["settings_fingerprint"] else None)
+            if reason:
+                self.mark(reason)
+                self.terminal.add(self.operation)
+                return False
+            if not self.ready or self.inputs or self.pending or self.approvals or self.active:
+                return False
+            # Check again under the same lock order as the command. Cancelling
+            # or activating another release cannot race the shutdown boundary.
+            with lock(self.root / ".reconnect.lock", blocking=False), lock(self.root / ".install.lock", blocking=False):
+                current = load(path)
+                if (current != request or request["expires_at"] <= time.time()
+                        or settings_fingerprint(load(self.root / "settings.json")) != request["settings_fingerprint"]):
+                    return False
+                verify_reconnect_install(load(self.root / "settings.json"))
+                self.reopen_threads = sorted(self.lifecycle.threads)
+                self.draining = True
+                self.mark("shutting_down")
+                self.publish()
+                return True
+
+    def finish(self):
+        if self.draining:
+            self.mark("closed")
+
+
 def adapter(settings, arguments):
     if os.environ.get("_AI_FENCE_DESKTOP_OWNED") == "1":
         fail("recursive desktop adapter dispatch; native executable/runtime must be absolute")
@@ -872,7 +1228,7 @@ def adapter(settings, arguments):
                 "-c", 'cli_auth_credentials_store="ephemeral"', *arguments]
     lease = dict(pid=os.getpid(), start=process_identity(os.getpid()))
     live = root / "launches" / (str(os.getpid()) + ".json")
-    save(live, dict(format=FORMAT, **lease, child_pid=None, profile=settings["profile"],
+    save(live, dict(format=FORMAT, **lease, started_at=time.time(), child_pid=None, profile=settings["profile"],
                     state_home=settings["state_home"], logical_cwd=os.environ.get("PWD", os.getcwd()),
                     physical_cwd=str(Path.cwd().resolve()), fenced=not direct_native,
                     mode="native-stdio" if direct_native else "desktop-stdio" if command == "app-server" else "cli",
@@ -908,6 +1264,7 @@ def adapter(settings, arguments):
         item = load(live)
         item["child_pid"] = child.pid
         save(live, item)
+    reconnection = ReconnectSession(settings, live, lifecycle) if not interactive and not direct_native else None
     output_lock = threading.Lock()
     def send(value):
         with output_lock:
@@ -934,29 +1291,39 @@ def adapter(settings, arguments):
                 while b"\n" in pending:
                     line, pending = pending.split(b"\n", 1)
                     value = json.loads(line)
-                    try:
-                        if auth_bridge:
-                            if value.get("method") == "initialize":
-                                auth_runtime.initialize(settings, value)
-                            if auth_bridge.client(value):
-                                continue
-                            if value.get("method") == "turn/start" and not auth_bridge.sync():
-                                raise auth_runtime.AuthError()
-                        lifecycle.request(value)
-                    except auth_runtime.AuthError as error:
-                        send(auth_bridge.error(value.get("id"), error))
-                        continue
-                    except (RuntimeError, OSError, ValueError) as error:
-                        send({"jsonrpc": "2.0", "id": value.get("id"), "error": {
-                            "code": -32602, "message": "AI Fence workspace preflight: " + str(error)[:500],
-                            "data": {"origin":"ai_fence", "stage":"workspace_preflight", "retryable":False, "native_forwarded":False}}})
-                        continue
-                    native_send(value)
-                    if auth_bridge and value.get("method") == "initialized":
+                    with reconnection.input() if reconnection else contextlib.nullcontext(True) as allowed:
+                        if not allowed:
+                            if "id" in value and "method" in value:
+                                send({"jsonrpc": "2.0", "id": value["id"], "error": {
+                                    "code": -32000, "message": "AI Fence connection is reconnecting; reopen the saved chat.",
+                                    "data": {"origin": "ai_fence", "stage": "reconnect", "retryable": True, "native_forwarded": False}}})
+                            continue
                         try:
-                            auth_bridge.sync()
+                            if auth_bridge:
+                                if value.get("method") == "initialize":
+                                    auth_runtime.initialize(settings, value)
+                                if auth_bridge.client(value):
+                                    continue
+                                if value.get("method") == "turn/start" and not auth_bridge.sync():
+                                    raise auth_runtime.AuthError()
+                            lifecycle.request(value)
                         except auth_runtime.AuthError as error:
-                            send(auth_bridge.error(None, error))
+                            send(auth_bridge.error(value.get("id"), error))
+                            continue
+                        except (RuntimeError, OSError, ValueError) as error:
+                            send({"jsonrpc": "2.0", "id": value.get("id"), "error": {
+                                "code": -32602, "message": "AI Fence workspace preflight: " + str(error)[:500],
+                                "data": {"origin":"ai_fence", "stage":"workspace_preflight", "retryable":False, "native_forwarded":False}}})
+                            continue
+                        with reconnection.gate if reconnection else contextlib.nullcontext():
+                            if reconnection:
+                                reconnection.client(value)
+                            native_send(value)
+                        if auth_bridge and value.get("method") == "initialized":
+                            try:
+                                auth_bridge.sync()
+                            except auth_runtime.AuthError as error:
+                                send(auth_bridge.error(None, error))
         except (BrokenPipeError, OSError, ValueError):
             pass
         finally:
@@ -993,6 +1360,8 @@ def adapter(settings, arguments):
     buffer = b""
     try:
         while True:
+            if reconnection and reconnection.poll():
+                stop(signal.SIGTERM, None)
             if deadline and time.monotonic() > deadline:
                 os.killpg(child.pid, signal.SIGKILL)
                 deadline = None
@@ -1011,13 +1380,16 @@ def adapter(settings, arguments):
                 if auth_bridge and auth_bridge.runtime(value):
                     continue
                 try:
-                    forward = lifecycle.response(value)
+                    with reconnection.gate if reconnection else contextlib.nullcontext():
+                        forward = lifecycle.response(value)
+                        if reconnection:
+                            reconnection.native(value)
+                        if forward:
+                            send(value)
                 except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
                     print("ai-fence codex: thread workspace registration/checkpoint failed", file=sys.stderr)
                     stop(signal.SIGTERM, None)
                     break
-                if forward:
-                    send(value)
         status = child.wait(timeout=5)
     finally:
         if auth_bridge:
@@ -1033,6 +1405,11 @@ def adapter(settings, arguments):
             os.killpg(child.pid, signal.SIGKILL)
             child.wait()
         lifecycle.close()
+        if reconnection:
+            try:
+                reconnection.finish()
+            except (OSError, ValueError, RuntimeError, KeyError, StopIteration):
+                print("ai-fence codex: reconnect receipt unavailable after shutdown", file=sys.stderr)
         live.unlink(missing_ok=True)
     return status if status >= 0 else 128 - status
 
@@ -1067,6 +1444,8 @@ def doctor(settings, args):
                   credential_probe="not performed; transport/history availability does not prove provider authentication",
                   installed_cli_version=settings.get("cli_version", "unknown"), installed_cli_sha256=settings.get("cli_sha256"),
                   update_policy=settings.get("update_policy", "off"),
+                  reconnect_policy=settings.get("reconnect_policy", "auto"),
+                  automatic_reconnect_enabled=reconnect_enabled(settings),
                   running_older_release=any(item["alive"] and item.get("release") != settings["release"] for item in launches),
                   native_path=settings["native_codex"], native_version=settings["native_version"],
                   native_unchanged=Path(settings["native_codex"]).is_file() and digest(settings["native_codex"]) == settings["native_sha256"],
@@ -1083,6 +1462,8 @@ def doctor(settings, args):
     update_receipt = root / "update-status.json"
     if update_receipt.exists():
         report["update_status"] = json.loads(update_receipt.read_text())
+    if (root / "reconnect-request.json").exists():
+        report["reconnect"] = reconnect(settings, status=True)
     if getattr(args, "check_auth", False):
         version = settings.get("native_version", "codex-cli 0").removeprefix("codex-cli ")
         if not re.fullmatch(r"[0-9.]+", version):
@@ -1158,6 +1539,10 @@ def uninstall(settings, apply):
             for path in paths:
                 path.unlink()
             (root / "settings.json").rename(root / "uninstalled-settings.json")
+            try:
+                unregister_installation(settings)
+            except (OSError, ValueError, RuntimeError):
+                print("ai-fence codex: terminal update registration removal deferred", file=sys.stderr)
 
 
 def listener_owned(pid, port):
@@ -1264,7 +1649,8 @@ def control(arguments):
     setup.add_argument("--readiness-seconds", type=int, choices=range(0, 121), default=45, help="bounded passive wait for configured native/state storage")
     setup.add_argument("--auth-home", "--seed-home", dest="auth_home", type=Path,
                        help="single native ChatGPT credential owner; defaults to native CODEX_HOME on a fresh setup, retained on upgrade; select --state-home's path for profile auth")
-    setup.add_argument("--updates", choices=["auto", "manual", "off"], help="verified CLI updates on future app-server launches (default auto); active sessions are retained")
+    setup.add_argument("--updates", choices=["auto", "manual", "off"], help="verified checks from terminal updates and future app-server launches (default auto)")
+    setup.add_argument("--reconnect", choices=["auto", "off"], help="idle reconnects after verified updates (default auto); retained on upgrade")
     setup.add_argument("--update-base-url", help="trusted HTTPS AI Fence release server, default https://ai.yml.world")
     setup.add_argument("--update-interval-seconds", type=int, choices=range(60, 604801), help="successful update-check interval, default 86400; failures back off 300 seconds")
     setup.add_argument("--prepare-only", type=Path, help=argparse.SUPPRESS)
@@ -1286,8 +1672,22 @@ def control(arguments):
     workspace.add_argument("arguments", nargs=argparse.REMAINDER)
     commands.add_parser("rollback", help="select previous installed release; does not restore history or workspaces")
     commands.add_parser("windows-launcher", help="print the packaged session-only Windows launcher")
-    update = commands.add_parser("update", help="check/install a verified CLI release for future connections; never restart active chats")
+    commands.add_parser("register", help="register an existing official installation for terminal automatic updates")
+    registered = commands.add_parser("update-registered", help=argparse.SUPPRESS)
+    registered.add_argument("--source-base-url", required=True)
+    update = commands.add_parser("update", help="install a verified release; optionally reconnect older desktop connections at idle")
     update.add_argument("--check-only", action="store_true")
+    reconnect_option = update.add_mutually_exclusive_group()
+    reconnect_option.add_argument("--reconnect", action="store_true", default=None, help="enable idle reconnects after update (default on; overrides environment and stored policy)")
+    reconnect_option.add_argument("--no-reconnect", dest="reconnect", action="store_false", help="update the installation while retaining existing connections")
+    connection = commands.add_parser("reconnect", help="preview or schedule cooperative desktop reconnects without restarting WSL or the desktop app")
+    action = connection.add_mutually_exclusive_group()
+    action.add_argument("--apply", action="store_true", help="close the selected connections when idle so Codex can reconnect")
+    action.add_argument("--status", action="store_true", help="show the last operation and saved thread IDs to reopen")
+    action.add_argument("--cancel", action="store_true", help="cancel pending requests; shutdowns already acknowledged cannot be undone")
+    connection.add_argument("--pid", type=int, help="select one adapter from doctor; default all managed desktop connections in this installation")
+    connection.add_argument("--wait-seconds", type=int, choices=range(1, 301), default=60, metavar="1..300",
+                            help="expire an unacknowledged reconnect after this idle wait (default 60); never interrupt active turns")
     router = commands.add_parser("discovery-router", help="print an optional router: all app-server invocations use this profile; ordinary native CLI remains native")
     router.add_argument("--launch-prefix", nargs=argparse.REMAINDER, default=[],
                         help="optional existing memory/admission launcher prefix, applied to BOTH routes")
@@ -1308,6 +1708,9 @@ def control(arguments):
     if args.command == "windows-launcher":
         print(WINDOWS_SESSION_LAUNCHER)
         return 0
+    if args.command == "update-registered":
+        print(json.dumps(update_registered(args.source_base_url)))
+        return 0
     settings = load(args.install_root.expanduser().resolve() / "settings.json")
     if args.command in {"doctor", "status"}:
         healthy = doctor(settings, args)
@@ -1315,11 +1718,23 @@ def control(arguments):
     elif args.command == "workspace":
         return workspace_control(settings, args)
     elif args.command == "update":
+        if args.check_only and args.reconnect:
+            parser.error("--check-only cannot be combined with --reconnect")
         if not args.check_only:
             wait_for_payloads(settings)
         result = updates.check(settings, force=True, check_only=args.check_only)
+        if not args.check_only:
+            result["reconnect"] = reconnect_after_update(settings, result, args.reconnect)
         print(json.dumps(result))
-        return 1 if result["status"] == "failed" else 0
+        return 1 if result["status"] == "failed" or result.get("reconnect", {}).get("status") == "manual_reconnect_required" else 0
+    elif args.command == "register":
+        register_installation(settings)
+        print(json.dumps(dict(status="registered", install_root=settings["install_root"])))
+    elif args.command == "reconnect":
+        result = reconnect(settings, apply=args.apply, status=args.status, cancel=args.cancel,
+                           pid=args.pid, wait_seconds=args.wait_seconds)
+        print(json.dumps(result))
+        return 1 if result["status"] == "manual_reconnect_required" else 0
     elif args.command == "discovery-router":
         print(discovery_router(settings, args.launch_prefix), end="")
     elif args.command == "uninstall":
@@ -1351,6 +1766,15 @@ def main():
         if (os.environ.get("AI_FENCE_CODEX_DESKTOP", "1").lower() not in OFF and
                 subcommand(arguments)[0] == "app-server" and not any(arg in {"--help", "-h", "--version", "-V"} for arg in arguments)):
             result = updates.check(settings)
+            try:
+                register_installation(load(Path(settings["install_root"]) / "settings.json"))
+                outcome = reconnect_after_update(settings, result)
+                if outcome["status"] == "scheduled":
+                    print("ai-fence codex: older desktop connections will reconnect when idle; reopen their saved chats", file=sys.stderr)
+                elif outcome["status"] == "manual_reconnect_required":
+                    print("ai-fence codex: reconnect older adapters manually once to enable automatic reconnects", file=sys.stderr)
+            except (OSError, ValueError, RuntimeError):
+                print("ai-fence codex: automatic reconnect deferred; use doctor or reconnect --status", file=sys.stderr)
             if result["status"] == "installed":
                 selected = load(Path(settings["install_root"]) / "settings.json")
                 os.environ["_AI_FENCE_DESKTOP_SETTINGS"] = json.dumps(selected)

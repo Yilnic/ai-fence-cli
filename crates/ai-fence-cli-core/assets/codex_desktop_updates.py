@@ -47,6 +47,7 @@ def setup_arguments(settings):
               "--profile", settings["profile"], "--snapshots", settings["snapshot_policy"],
               "--readiness-seconds", str(settings.get("readiness_seconds", 45)),
               "--updates", settings.get("update_policy", "auto"),
+              "--reconnect", settings.get("reconnect_policy", "auto"),
               "--update-base-url", settings.get("update_base_url", "https://ai.yml.world"),
               "--update-interval-seconds", str(settings.get("update_interval_seconds", 86400))]
     for field, flag in [("workspace_registry", "--workspace-registry"), ("snapshot_directory", "--snapshot-directory")]:
@@ -72,6 +73,8 @@ def activate(root, expected, staging):
                 raise ValueError("automatic update cannot change profile or filesystem policy")
         if proposed.get("launch_prefix", []) != current.get("launch_prefix", []):
             raise ValueError("automatic update cannot change admission policy")
+        if proposed.get("reconnect_policy", "auto") != current.get("reconnect_policy", "auto"):
+            raise ValueError("automatic update cannot change reconnect policy")
         old_mutable = {name for name in current.get("files", {}) if not name.startswith("releases/")}
         new_mutable = {name for name in proposed.get("files", {}) if not name.startswith("releases/")}
         if old_mutable != new_mutable:

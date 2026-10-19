@@ -35,7 +35,7 @@ class NativeUpdates(unittest.TestCase):
             admission.write_text("#!/bin/sh\nprintf 'admitted\\n' >> '" + str(admission_log) + "'\n[ \"$1\" != -- ] || shift\nexec \"$@\"\n")
             admission.chmod(0o700)
             setup = [str(cli), "codex-desktop", "--install-root", str(install), "setup", "--native-codex", str(native),
-                     "--state-home", str(state), "--auth-home", str(state), "--profile", "fixture", "--updates", "off",
+                     "--state-home", str(state), "--auth-home", str(state), "--profile", "fixture", "--updates", "off", "--reconnect", "off",
                      "--launch-prefix", str(admission), "--"]
             installed = subprocess.run(setup, env=environment, capture_output=True, timeout=30)
             self.assertEqual(installed.returncode, 0, "isolated setup failed: " + installed.stderr.decode()[:900])

@@ -38,6 +38,28 @@ writable Btrfs copies for parallel agents, short `fws` commands and ordinary
 `cd` followed by existing fenced aliases. CLI and Codex desktop share workspace
 identity and leases; read-only checkpoints are separately opt-in.
 
+## Codex desktop updates (v0.1.9)
+
+Verified updates request older managed desktop connections to reconnect when
+idle by default. Normal terminal automatic-update checks also service registered
+desktop installations on the same release server and channel. Setup and new
+desktop launches register their existing profile/state-home identities; missing
+stores are never recreated and different accounts are never merged.
+
+Use `ai-fence-cli codex-desktop update --no-reconnect` for one update, or export
+`AI_FENCE_CODEX_RECONNECT=off`. The command flag overrides the environment, which
+overrides the saved setup policy (`--reconnect off`). Explicit `--reconnect`
+enables the behavior for one update. `codex-desktop reconnect` previews the
+connections; `--apply`, `--status` and `--cancel` manage an idle reconnect request.
+Active turns and approvals are allowed to finish instead of force-restarting work.
+
+The adapter requires Linux/WSL, Python 3.11+ and native stdio transport. It does
+not restart WSL, the desktop application or ordinary terminal/native Windows
+sessions. Saved desktop chats may need reopening after reconnecting. An older
+already-running adapter needs one manual reconnect to gain cooperative control;
+older custom installations can register once using
+`codex-desktop --install-root PATH register`. No periodic monitor is installed.
+
 ## Source boundary
 
 The proprietary request-processing engine is intentionally not part of this
