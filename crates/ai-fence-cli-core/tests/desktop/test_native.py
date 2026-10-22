@@ -98,6 +98,45 @@ class Client:
 
 @unittest.skipUnless(os.environ.get("AF_TEST_CLI") and os.environ.get("AF_TEST_NATIVE"), "set AF_TEST_CLI and AF_TEST_NATIVE")
 class NativeIntegration(unittest.TestCase):
+    def test_dev_channel_survives_prod_desktop_environment_without_changing_history(self):
+        with tempfile.TemporaryDirectory(prefix="af-native-dev-channel-") as temporary:
+            root = Path(temporary)
+            home, state, install = root / "home", root / "state", root / "adapter"
+            home.mkdir()
+            state.mkdir()
+            auth = json.dumps({"auth_mode":"apikey", "OPENAI_API_KEY":"fixture-invalid-no-inference"})
+            (state / "auth.json").write_text(auth)
+            (state / "history-marker").write_text("keep existing history")
+            environment = {k:v for k,v in os.environ.items()
+                           if not k.startswith(("AI_FENCE_", "OPENAI_", "ANTHROPIC_", "CODEX_"))}
+            environment.update(HOME=str(home), XDG_CONFIG_HOME=str(root / "config"),
+                               AI_FENCE_CLI_CHANNEL="prod", AI_FENCE_SNAPSHOTS="off",
+                               OPENAI_API_BASE="http://127.0.0.1:1", OTEL_SDK_DISABLED="true")
+            cli = str(Path(os.environ["AF_TEST_CLI"]).resolve())
+            setup = [cli, "codex-desktop", "--install-root", str(install), "setup", "--channel", "dev",
+                     "--update-base-url", "https://dev.example.test", "--native-codex",
+                     str(Path(os.environ["AF_TEST_NATIVE"]).resolve()), "--state-home", str(state),
+                     "--auth-home", str(state), "--updates", "off", "--reconnect", "off", "--profile", "default"]
+            subprocess.run(setup, env=environment, capture_output=True, timeout=30, check=True)
+            settings = json.loads((install / "settings.json").read_text())
+            self.assertEqual((settings["channel"], settings["profile"]), ("dev", "default"))
+            self.assertEqual(settings["update_base_url"], "https://dev.example.test")
+            before = (install / "settings.json").read_bytes()
+            subprocess.run(setup, env=environment, capture_output=True, timeout=30, check=True)
+            self.assertEqual((install / "settings.json").read_bytes(), before)
+            client = Client(install / "bin/codex", environment)
+            try:
+                self.assertTrue(client.endpoint(2).startswith("http://127.0.0.1:"))
+                launches = [json.loads(path.read_text()) for path in (install / "launches").glob("*.json")]
+                self.assertEqual(len(launches), 1)
+                proxy = launches[0]["proxy_pid"]
+                values = Path(f"/proc/{proxy}/environ").read_bytes().split(b"\0")
+                self.assertIn(b"AI_FENCE_CLI_CHANNEL=dev", values)
+                self.assertEqual((state / "auth.json").read_text(), auth)
+                self.assertEqual((state / "history-marker").read_text(), "keep existing history")
+            finally:
+                client.close()
+
     def test_official_setup_concurrent_endpoints_upgrade_peer_exit_and_sigterm(self):
         with tempfile.TemporaryDirectory(prefix="af-native-setup-") as temporary:
             root = Path(temporary)

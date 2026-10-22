@@ -59,6 +59,16 @@ class RegisteredUpdates(unittest.TestCase):
         self.assertTrue(reconnect.call_args.kwargs["automatic"])
         self.assertTrue(reconnect.call_args.kwargs["older_only"])
 
+    def test_changed_dev_binary_bypasses_deferral_even_at_same_version(self):
+        self.settings.update(channel="dev", cli_sha256="0" * 64)
+        with patch.dict(os.environ, {"AI_FENCE_CLI_CHANNEL":"dev"}):
+            self.register()
+            with patch.object(desktop, "digest", return_value="1" * 64), \
+                    patch.object(desktop.updates, "version", return_value=(0,1,9)):
+                result, update, reconnect = self.check()
+        self.assertTrue(update.call_args.kwargs["force"])
+        self.assertTrue(reconnect.call_args.kwargs["older_only"])
+
     def test_environment_and_saved_policy_disable_reconnect_but_allow_updates(self):
         root = self.register()
         with patch.dict(os.environ, {"AI_FENCE_CODEX_RECONNECT": "off"}):

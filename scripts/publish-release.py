@@ -29,7 +29,11 @@ def validate_plan(plan):
         artifact = plan["artifacts"][target]
         if artifact["filename"] != filename:
             raise ValueError("unexpected artifact filename")
-        if artifact["source_url"] != f"https://ai.yml.world/downloads/candidate/{filename}":
+        if artifact["source_url"] not in {
+            f"https://ai.yaaf.de/downloads/candidate/{filename}",
+            # Retain validation of historical, immutable release plans.
+            f"https://ai.yml.world/downloads/candidate/{filename}",
+        }:
             raise ValueError("artifact source is not the production candidate endpoint")
         if not re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]):
             raise ValueError("invalid SHA-256")

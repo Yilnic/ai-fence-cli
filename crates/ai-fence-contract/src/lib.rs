@@ -235,6 +235,8 @@ pub struct GatewayUsage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GatewayProvider {
+    #[serde(rename = "decisions")]
+    Decisions,
     #[serde(rename = "openai")]
     OpenAI,
     #[serde(rename = "anthropic")]
@@ -244,6 +246,7 @@ pub enum GatewayProvider {
 impl GatewayProvider {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Decisions => "decisions",
             Self::OpenAI => "openai",
             Self::Anthropic => "anthropic",
         }
@@ -251,6 +254,7 @@ impl GatewayProvider {
 
     pub fn from_db(value: &str) -> Self {
         match value {
+            "decisions" => Self::Decisions,
             "anthropic" => Self::Anthropic,
             _ => Self::OpenAI,
         }
@@ -259,6 +263,8 @@ impl GatewayProvider {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderEndpointType {
+    #[serde(rename = "decisions")]
+    Decisions,
     #[serde(rename = "openai_responses")]
     OpenAIResponses,
     #[serde(rename = "openai_chat_completions")]
@@ -278,6 +284,7 @@ pub enum ProviderEndpointType {
 impl ProviderEndpointType {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Decisions => "decisions",
             Self::OpenAIResponses => "openai_responses",
             Self::OpenAIChatCompletions => "openai_chat_completions",
             Self::OpenAICompletions => "openai_completions",
@@ -290,6 +297,7 @@ impl ProviderEndpointType {
 
     pub fn from_db(value: &str) -> Self {
         match value {
+            "decisions" => Self::Decisions,
             "openai_chat_completions" => Self::OpenAIChatCompletions,
             "openai_completions" => Self::OpenAICompletions,
             "openai_embeddings" => Self::OpenAIEmbeddings,

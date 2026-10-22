@@ -173,10 +173,36 @@ pub fn config_dir_for_channel(channel: Option<&str>) -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn current_channel() -> Option<String> {
-    std::env::var("AI_FENCE_CLI_CHANNEL")
-        .ok()
-        .or_else(|| std::env::var("AI_FENCE_STAGE").ok())
+pub fn current_channel() -> Option<String> {
+    // Windows installs the channel-named executable directly, without a POSIX
+    // wrapper. Its name must select DEV even in an inherited production shell.
+    let executable = std::env::current_exe().ok().and_then(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(channel_from_executable_name)
+    });
+    let value = executable.or_else(|| {
+        std::env::var("AI_FENCE_CLI_CHANNEL")
+            .ok()
+            .or_else(|| std::env::var("AI_FENCE_STAGE").ok())
+    });
+    let name = config_dir_name_for_channel(value.as_deref());
+    name.strip_prefix("ai-fence-").map(str::to_string)
+}
+
+fn channel_from_executable_name(name: &str) -> Option<String> {
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    let channel = name.strip_prefix("ai-fence-cli-")?;
+    match channel {
+        "" | "linux-x86_64" | "windows-x86_64" | "macos-aarch64" => None,
+        _ => Some(channel.to_string()),
+    }
+}
+
+/// Native state and durable templates are installation-channel state, not a
+/// named launch profile. Both PROD and DEV may use the profile named default.
+pub fn runtime_home_for_channel(home: &std::path::Path, channel: Option<&str>) -> PathBuf {
+    home.join(format!(".{}", config_dir_name_for_channel(channel)))
 }
 
 fn config_dir_name_for_channel(channel: Option<&str>) -> String {
@@ -358,6 +384,44 @@ mod tests {
             config_dir_name_for_channel(Some("qa/west")),
             "ai-fence-qa_west"
         );
+    }
+
+    #[test]
+    fn runtime_homes_are_channel_specific_without_changing_profile_names() {
+        let home = std::path::Path::new("/user");
+        assert_eq!(runtime_home_for_channel(home, None), home.join(".ai-fence"));
+        assert_eq!(
+            runtime_home_for_channel(home, Some("prod")),
+            home.join(".ai-fence")
+        );
+        assert_eq!(
+            runtime_home_for_channel(home, Some("DEV")),
+            home.join(".ai-fence-dev")
+        );
+        assert_eq!(
+            runtime_home_for_channel(home, Some("qa/west")),
+            home.join(".ai-fence-qa_west")
+        );
+    }
+
+    #[test]
+    fn named_binaries_select_channels_but_download_asset_names_do_not() {
+        assert_eq!(
+            channel_from_executable_name("ai-fence-cli-dev.exe").as_deref(),
+            Some("dev")
+        );
+        assert_eq!(
+            channel_from_executable_name("ai-fence-cli-dev").as_deref(),
+            Some("dev")
+        );
+        for name in [
+            "ai-fence-cli",
+            "ai-fence-cli-linux-x86_64",
+            "ai-fence-cli-windows-x86_64.exe",
+            "ai-fence-cli-macos-aarch64",
+        ] {
+            assert_eq!(channel_from_executable_name(name), None);
+        }
     }
 
     #[test]

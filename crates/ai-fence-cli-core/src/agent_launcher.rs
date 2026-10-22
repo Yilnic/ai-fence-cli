@@ -365,9 +365,43 @@ pub fn detect_agent(command: &[String]) -> Option<ResolvedAgent> {
 }
 
 pub fn default_ai_fence_home() -> Option<PathBuf> {
-    std::env::var_os("AI_FENCE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| effective_user_home_dir().map(|home| home.join(".ai-fence")))
+    let channel = crate::config::current_channel();
+    let staged_home = channel.as_ref().and_then(|channel| {
+        let name: String = channel
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        std::env::var_os(format!("AI_FENCE_{name}_HOME")).map(PathBuf::from)
+    });
+    default_home_for_channel(
+        effective_user_home_dir().as_deref(),
+        channel.as_deref(),
+        std::env::var_os("AI_FENCE_HOME").map(PathBuf::from),
+        staged_home,
+    )
+}
+
+fn default_home_for_channel(
+    user_home: Option<&Path>,
+    channel: Option<&str>,
+    production_home: Option<PathBuf>,
+    staged_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    // A DEV command launched inside a production fenced shell inherits its
+    // AI_FENCE_HOME. Never turn that into shared native history/configuration.
+    let explicit = if channel.is_some() {
+        staged_home
+    } else {
+        production_home
+    };
+    explicit
+        .or_else(|| user_home.map(|home| crate::config::runtime_home_for_channel(home, channel)))
 }
 
 /// Resolve the inherited home, or fall back to the effective operating-system
@@ -1618,10 +1652,9 @@ fn configure_codex_proxy_provider(config: &mut TomlTable, proxy_base: &str) {
         "wire_api".to_string(),
         toml::Value::String("responses".to_string()),
     );
-    provider.insert(
-        "supports_websockets".to_string(),
-        toml::Value::Boolean(true),
-    );
+    provider
+        .entry("supports_websockets".to_string())
+        .or_insert(toml::Value::Boolean(true));
 }
 
 fn should_write_codex_model_catalog(model: &str) -> bool {
@@ -3372,6 +3405,68 @@ mod tests {
         let config_dir = resolve_config_dir(Some(&explicit)).expect("config dir");
 
         assert_eq!(config_dir, explicit);
+    }
+
+    #[test]
+    fn channels_isolate_default_profiles_from_inherited_production_home() {
+        let user = Path::new("/user");
+        let production = PathBuf::from("/custom/production-state");
+        let dev = default_home_for_channel(Some(user), Some("dev"), Some(production.clone()), None)
+            .unwrap();
+        assert_eq!(dev, user.join(".ai-fence-dev"));
+        let prod =
+            default_home_for_channel(Some(user), None, Some(production.clone()), None).unwrap();
+        assert_eq!(prod, production);
+        let dev_profile = resolve_agent_profile(&dev, "default", ResolvedAgent::Codex).unwrap();
+        let prod_profile = resolve_agent_profile(&prod, "default", ResolvedAgent::Codex).unwrap();
+        assert_eq!(dev_profile.name, "default");
+        assert_eq!(prod_profile.name, "default");
+        assert_ne!(dev_profile.root_dir, prod_profile.root_dir);
+        assert_eq!(
+            default_home_for_channel(
+                Some(user),
+                Some("dev"),
+                Some(production),
+                Some(PathBuf::from("/custom/dev-state"))
+            ),
+            Some(PathBuf::from("/custom/dev-state"))
+        );
+    }
+
+    #[test]
+    fn codex_transport_setting_survives_native_config_regeneration() {
+        let temp = tempfile::tempdir().unwrap();
+        let template = temp.path().join("templates");
+        fs::create_dir_all(template.join(".codex")).unwrap();
+        fs::write(
+            template.join(".codex/config.toml"),
+            "[model_providers.ai_fence]\nsupports_websockets = false\n",
+        )
+        .unwrap();
+        let native = temp.path().join("state");
+        for port in [1234, 4321] {
+            write_codex_config(
+                &native,
+                &format!("http://127.0.0.1:{port}"),
+                Some("openai/test"),
+                Some(&template),
+                false,
+                CodexProviderAuth::EnvKey,
+            )
+            .unwrap();
+            let config: toml::Value = fs::read_to_string(native.join("config.toml"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                config["model_providers"]["ai_fence"]["supports_websockets"].as_bool(),
+                Some(false)
+            );
+            assert_eq!(
+                config["model_providers"]["ai_fence"]["base_url"].as_str(),
+                Some(format!("http://127.0.0.1:{port}/v1").as_str())
+            );
+        }
     }
 
     #[test]

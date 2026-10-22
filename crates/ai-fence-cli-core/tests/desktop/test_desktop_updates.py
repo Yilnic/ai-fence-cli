@@ -131,3 +131,63 @@ class UpdateTests(unittest.TestCase):
                 opener=lambda *a, **kw: self.fail("must not download an incompatible target"), run=run)
         self.assertEqual(result["status"], "unsupported_target")
         self.assertFalse(calls)
+
+    def dev_fixture(self):
+        manifest, fetch, run, calls = self.fixture()
+        self.settings.update(channel="dev", cli_version="0.1.9", cli_sha256="0" * 64,
+                             update_base_url="https://dev.example.test")
+        manifest.update(cli_name="ai-fence-cli-dev", download_url="https://dev.example.test/downloads/ai-fence-cli-linux-x86_64")
+        (Path(self.settings["install_root"]) / "settings.json").write_text(json.dumps(self.settings))
+        return manifest, fetch, run, calls
+
+    def test_dev_same_version_changed_hash_installs_and_keeps_channel(self):
+        manifest, fetch, run, calls = self.dev_fixture()
+        result = desktop.updates.check(self.settings, force=True, opener=fetch, run=run)
+        self.assertEqual(result["status"], "installed")
+        self.assertIn("--channel", calls[1])
+        self.assertEqual(calls[1][calls[1].index("--channel") + 1], "dev")
+        observed = json.loads((Path(self.settings["install_root"]) / "settings.json").read_text())
+        self.assertEqual(observed["channel"], "dev")
+        self.assertEqual(observed["update_base_url"], self.settings["update_base_url"])
+
+    def test_dev_same_hash_is_current_and_changed_hash_is_available_in_check_only(self):
+        manifest, fetch, run, calls = self.dev_fixture()
+        self.assertEqual(desktop.updates.check(self.settings, force=True, check_only=True, opener=fetch, run=run)["status"], "available")
+        self.settings["cli_sha256"] = manifest["sha256"]
+        self.assertEqual(desktop.updates.check(self.settings, force=True, opener=fetch, run=run)["status"], "current")
+        self.assertFalse(calls)
+
+    def test_prod_same_version_never_replaces_immutable_release_by_hash(self):
+        manifest, fetch, run, calls = self.fixture()
+        self.settings["cli_version"] = manifest["version"]
+        self.settings["cli_sha256"] = "0" * 64
+        self.assertEqual(desktop.updates.check(self.settings, force=True, opener=fetch, run=run)["status"], "current")
+        self.assertFalse(calls)
+
+    def test_dev_rejects_prod_manifest_or_foreign_download_before_execution(self):
+        manifest, fetch, run, calls = self.dev_fixture()
+        for changed in [{"cli_name":"ai-fence-cli"}, {"download_url":"https://other.example.test/cli"}]:
+            before = dict(manifest)
+            manifest.update(changed)
+            self.assertEqual(desktop.updates.check(self.settings, force=True, opener=fetch, run=run)["status"], "failed")
+            manifest.clear()
+            manifest.update(before)
+        self.assertFalse(calls)
+
+    def test_automatic_activation_cannot_rebind_channel_or_update_source(self):
+        manifest, fetch, run, calls = self.dev_fixture()
+        path = Path(self.settings["install_root"]) / "settings.json"
+        before = path.read_bytes()
+        for changed in [{"channel":"prod"}, {"update_base_url":"https://other.example.test"}]:
+            def prepare(argv, **kwargs):
+                result = run(argv, **kwargs)
+                if "setup" in argv:
+                    staged = Path(argv[argv.index("--prepare-only") + 1]) / "settings.json"
+                    settings = json.loads(staged.read_text())
+                    settings.update(changed)
+                    staged.write_text(json.dumps(settings))
+                return result
+            result = desktop.updates.check(self.settings, force=True, opener=fetch, run=prepare)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure_stage"], "activation")
+            self.assertEqual(path.read_bytes(), before)

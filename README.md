@@ -10,7 +10,7 @@ standalone mode. On Linux x86-64 or an Apple Silicon Mac running macOS 12+,
 with Codex or Claude Code already installed:
 
 ```sh
-curl -fsSL https://ai.yml.world/install.sh | bash
+curl -fsSL https://ai.yaaf.de/install.sh | bash
 export PATH="$HOME/.local/bin:$PATH"
 codex-fenced
 ```
@@ -25,9 +25,9 @@ transport-aware harness defaults such as `kimi-code` over Chat and `zcode`
 over Anthropic Messages.
 
 Windows x86-64 is available as a
-[manual download](https://ai.yml.world/download). The macOS preview is ad-hoc
+[manual download](https://ai.yaaf.de/download). The macOS preview is ad-hoc
 signed rather than Developer ID signed and notarized. See the
-[quickstart](https://ai.yml.world/docs) for provider auth, standalone data flow,
+[quickstart](https://ai.yaaf.de/docs) for provider auth, standalone data flow,
 logging, and manual install details.
 
 For model access that works while `codex-apps` or `/usage` requests login, see
@@ -61,6 +61,11 @@ older custom installations can register once using
 `codex-desktop --install-root PATH register`. No periodic monitor is installed.
 
 ## Source boundary
+
+Unreleased shared contracts add the `decisions` provider family and endpoint
+identifier for native decision accounting. Older published executables do not
+gain an adapter by updating these libraries. Decision/embedding normalization,
+policy and runtime transport are part of the official product engine.
 
 The proprietary request-processing engine is intentionally not part of this
 repository. The official binary composes this launcher with redaction,

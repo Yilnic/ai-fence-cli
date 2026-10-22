@@ -184,16 +184,48 @@ def reconnect_enabled(settings, explicit=None):
     return value not in OFF
 
 
-def installation_registry():
-    channel = os.environ.get("AI_FENCE_CLI_CHANNEL", os.environ.get("AI_FENCE_STAGE", "")).strip().lower()
-    suffix = "" if channel in {"", "prod"} else "-" + re.sub(r"[^a-z0-9._-]", "_", channel)
+def invocation_channel():
+    return updates.channel(os.environ.get("AI_FENCE_CLI_CHANNEL", os.environ.get("AI_FENCE_STAGE")))
+
+
+def default_install_root(channel):
+    suffix = "" if updates.channel(channel) == "prod" else "-" + updates.channel(channel)
+    return Path.home() / (".local/share/ai-fence-codex-desktop" + suffix)
+
+
+def setup_channel_options(args, old):
+    selected = updates.channel(getattr(args, "channel", None) or invocation_channel())
+    explicit_url = getattr(args, "update_base_url", None)
+    if explicit_url:
+        return selected, explicit_url
+    if old and updates.channel(old.get("channel")) == selected and old.get("update_base_url"):
+        return selected, old["update_base_url"]
+    suffix = "" if selected == "prod" else "-" + selected
+    root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    config = root / ("ai-fence" + suffix) / "cli.toml"
+    saved = tomllib.loads(config.read_text()) if config.is_file() else {}
+    staged = "AI_FENCE_" + re.sub(r"[^A-Z0-9]", "_", selected.upper()) + "_URL"
+    base = os.environ.get(staged) if selected != "prod" else None
+    base = base or saved.get("fence_url") or updates.default_base_url(selected)
+    if not base:
+        fail("configure this channel with setup --url or supply --update-base-url before desktop setup")
+    return selected, base
+
+
+def bind_channel(settings, environment):
+    environment["AI_FENCE_CLI_CHANNEL"] = updates.channel(settings.get("channel"))
+
+
+def installation_registry(channel=None):
+    selected = updates.channel(channel) if channel is not None else invocation_channel()
+    suffix = "" if selected == "prod" else "-" + selected
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / ("ai-fence" + suffix) / "codex-desktop-installs.json"
 
 
 def register_installation(settings):
     root = Path(settings["install_root"]).resolve(strict=True)
     trusted(root / "settings.json")
-    registry = installation_registry()
+    registry = installation_registry(settings.get("channel", "prod"))
     with lock(registry.with_suffix(".lock")):
         record = load(registry) if registry.exists() else dict(format=FORMAT, installations=[])
         entry = dict(install_root=str(root), identity=identity(root), profile=settings["profile"], state_home=settings["state_home"])
@@ -205,7 +237,7 @@ def register_installation(settings):
 
 
 def unregister_installation(settings):
-    registry = installation_registry()
+    registry = installation_registry(settings.get("channel", "prod"))
     if registry.exists():
         with lock(registry.with_suffix(".lock")):
             record = load(registry)
@@ -252,11 +284,14 @@ def update_registered(source_base_url):
             settings = load(root / "settings.json")
             if any(settings.get(k) != entry[k] for k in ["install_root", "profile", "state_home"]):
                 fail("registered installation identity changed")
-            if (settings.get("update_policy", "off") != "auto"
-                    or settings.get("update_base_url", "https://ai.yml.world").rstrip("/") != source_base_url.rstrip("/")):
+            if (updates.channel(settings.get("channel")) != invocation_channel()
+                    or settings.get("update_policy", "off") != "auto"
+                    or (settings.get("update_base_url") or updates.default_base_url(settings.get("channel"))).rstrip("/") != source_base_url.rstrip("/")):
                 results.append(dict(install_root=str(root), status="disabled_or_other_source"))
                 continue
             newer = updates.version(source_version) > updates.version(settings.get("cli_version", "unknown"))
+            if invocation_channel() != "prod" and updates.version(source_version) == updates.version(settings.get("cli_version", "unknown")):
+                newer = digest(source) != settings.get("cli_sha256")
             result = updates.check(settings, force=newer)
             result["reconnect"] = reconnect_after_update(settings, result)
             results.append(dict(install_root=str(root), **result))
@@ -297,6 +332,8 @@ def install(args):
         no_daemon_supported = native_help.returncode == 0 and b"--no-daemon" in native_help.stdout
         settings_path = root / "settings.json"
         old = load(settings_path) if settings_path.exists() else None
+        selected_channel, update_base = setup_channel_options(args, old)
+        updates.safe_url(update_base)
         prepared = getattr(args, "prepare_only", None)
         destination = Path(prepared).resolve() if prepared else root
         destination.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -401,7 +438,7 @@ def install(args):
             fail("unowned dispatch file exists")
         atomic(destination / "dispatch.py", dispatch, 0o700)
         files["dispatch.py"] = digest(destination / "dispatch.py")
-        settings = dict(format=FORMAT, install_root=str(root), release=release_id,
+        settings = dict(format=FORMAT, install_root=str(root), release=release_id, channel=selected_channel,
                         native_codex=str(native), native_version=version, native_sha256=digest(native), no_daemon_supported=no_daemon_supported,
                         profile=profile_name(args.profile), state_home=str(home), state_identity=identity(home), readiness_seconds=args.readiness_seconds,
                         workspace_registry=str((getattr(args, "workspace_registry", None) or Path(os.environ.get("AI_FENCE_WORKSPACE_HOME", Path.home() / ".ai-fence/workspace-registry"))).expanduser().absolute()),
@@ -411,7 +448,7 @@ def install(args):
                         files=files, launch_prefix=launch_prefix, cli_version=cli_version, cli_sha256=digest(cli),
                         update_policy=getattr(args, "updates", None) or (old or {}).get("update_policy", "auto"),
                         reconnect_policy=getattr(args, "reconnect", None) or (old or {}).get("reconnect_policy", "auto"),
-                        update_base_url=getattr(args, "update_base_url", None) or (old or {}).get("update_base_url", "https://ai.yml.world"),
+                        update_base_url=update_base,
                         update_interval_seconds=getattr(args, "update_interval_seconds", None) or (old or {}).get("update_interval_seconds", 86400), **auth)
         updates.safe_url(settings["update_base_url"])
         if settings["snapshot_policy"] != "off" and settings["roots"] and not settings["snapshot_directory"]:
@@ -429,6 +466,8 @@ def install(args):
             except (OSError, ValueError, RuntimeError):
                 print("ai-fence codex: terminal update registration deferred; run codex-desktop register when available", file=sys.stderr)
         print(json.dumps({"installed": True, "adapter": str(root / "bin/codex"),
+                          "channel": selected_channel, "update_base_url": update_base,
+                          "running_connections_unchanged": True,
                           "profile": settings["profile"], "state_home": str(home),
                           "native_version": version, "release": release_id,
                           "discovery": "select this adapter for the WSL connection; desktop discovery varies by version"}))
@@ -624,6 +663,7 @@ def runtime(settings, arguments):
     if settings.get("auth_mode") == "native-owner":
         arguments[index:index] = ["-c", 'cli_auth_credentials_store="ephemeral"']
     env = os.environ.copy()
+    bind_channel(settings, env)
     env["AI_FENCE_SNAPSHOTS"] = env.pop("_AI_FENCE_DESKTOP_CHECKPOINT_POLICY", settings["snapshot_policy"])
     for key in ["AI_FENCE_SNAPSHOT_ROOT", "AI_FENCE_SNAPSHOT_ID", "AI_FENCE_SNAPSHOT_PATH", "AI_FENCE_SNAPSHOT_RECEIPT"]:
         env.pop(key, None)
@@ -1182,6 +1222,7 @@ def adapter(settings, arguments):
         fail("recursive desktop adapter dispatch; native executable/runtime must be absolute")
     wait_for_payloads(settings)
     env = os.environ.copy()
+    bind_channel(settings, env)
     env.pop("CODEX_INSTALL_DIR", None)
     env.pop("CODEX_CLI_PATH", None)
     command, position = subcommand(arguments)
@@ -1440,6 +1481,7 @@ def doctor(settings, args):
     sqlite_home = native_config.get("sqlite_home", os.environ.get("CODEX_SQLITE_HOME", str(home)))
     named = named_context(settings, Path.cwd())
     report = dict(format=FORMAT, profile=settings["profile"], state_home=str(home),
+                  channel=updates.channel(settings.get("channel")), update_base_url=settings.get("update_base_url") or updates.default_base_url(settings.get("channel")),
                   auth_home=settings.get("auth_home", str(home)), auth_mode=settings.get("auth_mode", "profile"),
                   credential_probe="not performed; transport/history availability does not prove provider authentication",
                   installed_cli_version=settings.get("cli_version", "unknown"), installed_cli_sha256=settings.get("cli_sha256"),
@@ -1641,9 +1683,10 @@ def discovery_router(settings, prefix):
 
 def control(arguments):
     parser = argparse.ArgumentParser(prog="ai-fence-cli codex-desktop")
-    parser.add_argument("--install-root", type=Path, default=Path.home() / ".local/share/ai-fence-codex-desktop")
+    parser.add_argument("--install-root", type=Path)
     commands = parser.add_subparsers(dest="command", required=True)
     setup = commands.add_parser("setup", help="install an opt-in desktop adapter without changing native Codex")
+    setup.add_argument("--channel", help="installation channel; normally selected by the channel-specific CLI command")
     setup.add_argument("--native-codex", required=True, type=Path)
     setup.add_argument("--state-home", required=True, type=Path, help="explicit stable Codex state store; never a run directory")
     setup.add_argument("--readiness-seconds", type=int, choices=range(0, 121), default=45, help="bounded passive wait for configured native/state storage")
@@ -1651,7 +1694,7 @@ def control(arguments):
                        help="single native ChatGPT credential owner; defaults to native CODEX_HOME on a fresh setup, retained on upgrade; select --state-home's path for profile auth")
     setup.add_argument("--updates", choices=["auto", "manual", "off"], help="verified checks from terminal updates and future app-server launches (default auto)")
     setup.add_argument("--reconnect", choices=["auto", "off"], help="idle reconnects after verified updates (default auto); retained on upgrade")
-    setup.add_argument("--update-base-url", help="trusted HTTPS AI Fence release server, default https://ai.yml.world")
+    setup.add_argument("--update-base-url", help="trusted HTTPS AI Fence release server; defaults to ai.yaaf.de (production) or ai-dev.yaaf.de (DEV)")
     setup.add_argument("--update-interval-seconds", type=int, choices=range(60, 604801), help="successful update-check interval, default 86400; failures back off 300 seconds")
     setup.add_argument("--prepare-only", type=Path, help=argparse.SUPPRESS)
     setup.add_argument("--launch-prefix", nargs=argparse.REMAINDER,
@@ -1661,6 +1704,8 @@ def control(arguments):
     setup.add_argument("--workspace-registry", type=Path, help="shared named workspace metadata; defaults to AI_FENCE_WORKSPACE_HOME or ~/.ai-fence/workspace-registry")
     setup.add_argument("--approve-root", type=Path, action="append", default=[])
     setup.add_argument("--snapshot-directory", type=Path)
+    switch = commands.add_parser("switch-channel", help="switch an explicitly selected adapter to this CLI channel, retaining history/auth/admission; reconnect when ready")
+    switch.add_argument("--update-base-url", help="explicit trusted release source; otherwise use this channel's saved CLI configuration")
     status = commands.add_parser("doctor", aliases=["status"])
     status.add_argument("--strict", action="store_true", help="exit nonzero on unhealthy file/route metadata")
     status.add_argument("--endpoint")
@@ -1702,6 +1747,21 @@ def control(arguments):
             args = selected
     if args is None:
         args = parser.parse_args(arguments)
+    if args.command == "switch-channel":
+        if args.install_root is None:
+            parser.error("switch-channel requires --install-root for the existing adapter")
+        current = load(args.install_root.expanduser().resolve() / "settings.json")
+        selected = invocation_channel()
+        source_args = argparse.Namespace(channel=selected, update_base_url=args.update_base_url)
+        _, base = setup_channel_options(source_args, current)
+        setup_args = updates.setup_arguments(current)[1:]
+        setup_args[setup_args.index("--channel") + 1] = selected
+        setup_args[setup_args.index("--update-base-url") + 1] = base
+        if current.get("launch_prefix"):
+            setup_args += ["--launch-prefix", *current["launch_prefix"]]
+        return control(setup_args)
+    if args.install_root is None:
+        args.install_root = default_install_root(getattr(args, "channel", None) or invocation_channel())
     if args.command == "setup":
         install(args)
         return 0
@@ -1712,6 +1772,7 @@ def control(arguments):
         print(json.dumps(update_registered(args.source_base_url)))
         return 0
     settings = load(args.install_root.expanduser().resolve() / "settings.json")
+    bind_channel(settings, os.environ)
     if args.command in {"doctor", "status"}:
         healthy = doctor(settings, args)
         return 0 if healthy or not args.strict else 1
@@ -1761,6 +1822,7 @@ def main():
     if mode == "control":
         return control(arguments)
     settings = settings_for_runtime()
+    bind_channel(settings, os.environ)
     if mode == "adapter":
         wait_for_payloads(settings)
         if (os.environ.get("AI_FENCE_CODEX_DESKTOP", "1").lower() not in OFF and

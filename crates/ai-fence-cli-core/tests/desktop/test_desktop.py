@@ -27,7 +27,10 @@ class DesktopTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="af-desktop-test-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        registry_environment = patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "config")})
+        registry_environment = patch.dict(os.environ, {
+            "XDG_CONFIG_HOME": str(self.root / "config"),
+            "AI_FENCE_CLI_CHANNEL": "prod",
+        })
         registry_environment.start()
         self.addCleanup(registry_environment.stop)
         self.home = self.root / "state"

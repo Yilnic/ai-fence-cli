@@ -19,6 +19,22 @@ def version(value):
     return tuple(int(part) for part in value.split("-", 1)[0].split("."))
 
 
+def channel(value=None):
+    if value is None:
+        value = "prod"
+    if not isinstance(value, str):
+        raise ValueError("invalid installation channel")
+    value = value.strip().lower() or "prod"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", value):
+        raise ValueError("invalid installation channel")
+    return value
+
+
+def default_base_url(selected=None):
+    """Only the two official channels have a public server suggestion."""
+    return {"prod": "https://ai.yaaf.de", "dev": "https://ai-dev.yaaf.de"}.get(channel(selected))
+
+
 def safe_url(value):
     parsed = urlsplit(value)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
@@ -42,13 +58,14 @@ def save(path, value):
 
 def setup_arguments(settings):
     result = ["codex-desktop", "--install-root", settings["install_root"], "setup",
+              "--channel", channel(settings.get("channel")),
               "--native-codex", settings["native_codex"], "--state-home", settings["state_home"],
               "--auth-home", settings.get("auth_home", settings["state_home"]),
               "--profile", settings["profile"], "--snapshots", settings["snapshot_policy"],
               "--readiness-seconds", str(settings.get("readiness_seconds", 45)),
               "--updates", settings.get("update_policy", "auto"),
               "--reconnect", settings.get("reconnect_policy", "auto"),
-              "--update-base-url", settings.get("update_base_url", "https://ai.yml.world"),
+              "--update-base-url", settings.get("update_base_url") or default_base_url(settings.get("channel")),
               "--update-interval-seconds", str(settings.get("update_interval_seconds", 86400))]
     for field, flag in [("workspace_registry", "--workspace-registry"), ("snapshot_directory", "--snapshot-directory")]:
         if settings.get(field):
@@ -67,6 +84,10 @@ def activate(root, expected, staging):
         proposed = json.loads((staging / "settings.json").read_text())
         if current != expected:
             raise ValueError("installation changed during update")
+        if (channel(proposed.get("channel")) != channel(current.get("channel"))
+                or (proposed.get("update_base_url") or default_base_url(proposed.get("channel")))
+                != (current.get("update_base_url") or default_base_url(current.get("channel")))):
+            raise ValueError("automatic update cannot change installation channel or source")
         for field in ["install_root", "state_home", "state_identity", "profile", "auth_home", "auth_identity", "auth_mode", "auth_account_key",
                       "native_codex", "native_version", "native_sha256", "roots", "snapshot_policy", "snapshot_directory", "workspace_registry", "update_policy"]:
             if proposed.get(field) != current.get(field):
@@ -133,7 +154,7 @@ def check(settings, force=False, check_only=False, opener=urlopen, run=subproces
         except OSError:
             return dict(status="failed", failure_stage="update_status")
         try:
-            base = settings.get("update_base_url", "https://ai.yml.world").rstrip("/")
+            base = (settings.get("update_base_url") or default_base_url(settings.get("channel"))).rstrip("/")
             origin = safe_url(base)
             if origin.query:
                 raise ValueError("release base cannot contain query parameters")
@@ -142,6 +163,7 @@ def check(settings, force=False, check_only=False, opener=urlopen, run=subproces
                 manifest = json.loads(response.read(65537))
             approved = manifest["version"]
             version(approved)
+            selected_channel = channel(settings.get("channel"))
             asset = safe_url(manifest["download_url"])
             github = (asset.hostname == "github.com" and asset.path ==
                       f"/Yilnic/ai-fence-cli/releases/download/v{approved}/ai-fence-cli-linux-x86_64")
@@ -150,7 +172,13 @@ def check(settings, force=False, check_only=False, opener=urlopen, run=subproces
                     or not (github or same_origin) or not re.fullmatch(r"[0-9a-f]{64}", manifest["sha256"])
                     or type(manifest["size_bytes"]) is not int or not 0 < manifest["size_bytes"] <= 512 * 1024 * 1024):
                 raise ValueError("invalid release manifest")
-            if version(approved) <= version(settings.get("cli_version", "unknown")):
+            expected_name = "ai-fence-cli" + ("" if selected_channel == "prod" else "-" + selected_channel)
+            if (manifest.get("cli_name", "ai-fence-cli") != expected_name
+                    or (selected_channel != "prod" and not same_origin)):
+                raise ValueError("release manifest does not match installation channel")
+            installed_version = version(settings.get("cli_version", "unknown"))
+            same_version_current = (selected_channel == "prod" or manifest["sha256"] == settings.get("cli_sha256"))
+            if version(approved) < installed_version or (version(approved) == installed_version and same_version_current):
                 result.update(status="current")
             elif check_only:
                 result.update(status="available", available_version=approved)

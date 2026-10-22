@@ -53,6 +53,18 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 release.validate_plan(plan)
 
+    def test_canonical_candidate_origin_and_legacy_plans_are_both_exact(self):
+        for origin in ["https://ai.yaaf.de", "https://ai.yml.world"]:
+            plan = self.plan()
+            for artifact in plan["artifacts"].values():
+                artifact["source_url"] = origin + "/downloads/candidate/" + artifact["filename"]
+            self.assertEqual(release.validate_plan(plan), "v0.1.1")
+        for origin in ["http://ai.yaaf.de", "https://ai.yaaf.de.evil.test", "https://ai-dev.yaaf.de"]:
+            plan = self.plan()
+            plan["artifacts"]["linux-x86_64"]["source_url"] = origin + "/downloads/candidate/ai-fence-cli-linux-x86_64"
+            with self.assertRaises(ValueError):
+                release.validate_plan(plan)
+
     def test_existing_release_is_immutable_even_if_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "binary"

@@ -37,6 +37,53 @@ are content-addressed and retained for rollback. Repeating identical setup is
 idempotent. The payload includes the CLI, adapter, runtime helper, snapshot
 command dispatcher and a Windows session launcher; Python is a prerequisite.
 
+## DEV channel
+
+Install and configure the DEV CLI first:
+
+```bash
+curl -fsSL https://ai-dev.yaaf.de/install.sh | bash
+ai-fence-cli-dev setup --url https://ai-dev.yaaf.de --mode backend
+ai-fence-cli-dev codex-desktop setup \
+  --native-codex /absolute/path/to/genuine/codex \
+  --state-home /absolute/path/to/chosen/codex/state \
+  --auth-home /absolute/path/to/native/auth/home
+```
+
+DEV is an installation channel, not a profile. The default adapter directory is
+`~/.local/share/ai-fence-codex-desktop-dev`; PROD retains
+`~/.local/share/ai-fence-codex-desktop`. Setup reads the update URL from the
+channel's saved CLI configuration (or explicit `--update-base-url`) and persists
+the channel. Future desktop launches retain that channel even when the app's
+environment selects PROD. DEV follows verified build hashes, including changed
+builds with the same package version; PROD retains version-only immutable release
+updates. `doctor` reports the selected channel and update URL.
+
+To switch an existing single adapter without re-entering its history/account or
+admission configuration, select its exact installation root:
+
+```bash
+ai-fence-cli-dev codex-desktop --install-root /existing/adapter/root switch-channel
+```
+
+This reuses the saved state home, auth home, profile, checkpoint approvals and
+admission launcher. The existing `rollback` command can restore its previous
+code/channel selection; reconnect when ready. Manual `setup` also accepts the
+existing root; retain its exact `--state-home`, `--auth-home` and `--profile` values.
+Use the existing admission launcher as `--launch-prefix` if configured; upgrades
+retain it when omitted. Explicit setup may switch the channel, but automatic
+updates cannot change the channel, update source, history, authentication owner,
+or admission policy. No profile named `dev` is created or required.
+
+Setup does not replace a running connection. Reconnect the selected app/WSL
+connection when ready; only one selected adapter needs to be active. Keep the
+existing adapter path/router to preserve discovery, or select the DEV adapter's
+`bin` directory for a separate installation. Use `ai-fence-cli-dev codex-desktop
+--install-root /existing/adapter/root doctor --strict` to inspect the result.
+This is the app's Codex/WSL stdio proxy, not a general ChatGPT network proxy.
+
+## Native authentication and state
+
 Authentication stays native, with one explicit credential owner. A fresh setup
 uses the native `CODEX_HOME` (normally `~/.codex`) for credentials while
 `--state-home` retains the existing conversations. Specify `--auth-home` once

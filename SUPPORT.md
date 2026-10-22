@@ -7,7 +7,7 @@ public Rust workspace:
 - GitLab: https://gitlab.com/matthid-ml/ai-fence-cli/-/issues
 
 Before filing an issue, check the
-[quickstart and troubleshooting guide](https://ai.yml.world/docs). Include:
+[quickstart and troubleshooting guide](https://ai.yaaf.de/docs). Include:
 
 - AI Fence CLI version from `ai-fence-cli --version`.
 - Operating system and CPU architecture.
