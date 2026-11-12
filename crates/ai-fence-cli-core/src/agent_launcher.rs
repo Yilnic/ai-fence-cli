@@ -4448,6 +4448,62 @@ custom_user_setting = "keep"
     }
 
     #[test]
+    fn upsert_codex_profile_mcp_server_refreshes_overlay_without_disturbing_other_profile_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp.path().join(".ai-fence");
+        let profile = resolve_agent_profile(&config_dir, "real-estate", ResolvedAgent::Codex)
+            .expect("profile");
+        fs::create_dir_all(&profile.root_dir).expect("profile dir");
+        fs::write(
+            codex_profile_config_path(&profile),
+            r#"
+custom_user_setting = "profile"
+custom_profile_setting = "keep"
+
+[mcp_servers.shared]
+command = "python"
+args = ["profile.py"]
+
+[mcp_servers.proj_creator_dev]
+command = "stale-server"
+"#,
+        )
+        .expect("write profile config");
+
+        upsert_codex_profile_mcp_server(
+            &profile,
+            &AgentMcpServer::streamable_http(
+                "proj_creator_dev",
+                "https://create-dev.matthid.de/api/mcp",
+            )
+            .with_bearer_token_env_var("PROJ_CREATOR_DEV_API_KEY"),
+        )
+        .expect("profile mcp");
+
+        let parsed: toml::Value = fs::read_to_string(codex_profile_config_path(&profile))
+            .expect("profile config")
+            .parse()
+            .expect("parse profile config");
+        assert_eq!(parsed["custom_user_setting"].as_str(), Some("profile"));
+        assert_eq!(parsed["custom_profile_setting"].as_str(), Some("keep"));
+        assert_eq!(
+            parsed["mcp_servers"]["shared"]["command"].as_str(),
+            Some("python")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["proj_creator_dev"]["url"].as_str(),
+            Some("https://create-dev.matthid.de/api/mcp")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["proj_creator_dev"]["bearer_token_env_var"].as_str(),
+            Some("PROJ_CREATOR_DEV_API_KEY")
+        );
+        assert!(parsed["mcp_servers"]["proj_creator_dev"]
+            .get("command")
+            .is_none());
+    }
+
+    #[test]
     fn write_claude_user_config_copies_template_and_merges_library_mcp_servers() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config_dir = temp.path().join(".ai-fence");

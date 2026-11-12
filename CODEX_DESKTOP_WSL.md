@@ -29,9 +29,10 @@ ordinary native CLI launches keep their native home. The profile default is
 `default`; selecting a profile never merges stores or accounts.
 
 The native path is resolved to its physical executable. AI Fence never renames
-or overwrites it. A native upgrade can select the new genuine executable by
-rerunning setup with the same state home and profile. Existing app-servers keep
-their executable, selected release, state home and process-owned endpoint.
+or overwrites it. By default, native upgrades select a new genuine executable by
+rerunning setup with the same state home and profile. For Windows Store desktop
+connections, automatic native updates are available as described below. Existing
+app-servers keep their executable, selected release, state home and process-owned endpoint.
 Setup checks owned file hashes and refuses edited/unowned commands. Releases
 are content-addressed and retained for rollback. Repeating identical setup is
 idempotent. The payload includes the CLI, adapter, runtime helper, snapshot
@@ -81,6 +82,44 @@ existing adapter path/router to preserve discovery, or select the DEV adapter's
 `bin` directory for a separate installation. Use `ai-fence-cli-dev codex-desktop
 --install-root /existing/adapter/root doctor --strict` to inspect the result.
 This is the app's Codex/WSL stdio proxy, not a general ChatGPT network proxy.
+
+## Following desktop runtime updates
+
+For an x86-64 WSL installation using shared native authentication, add
+`--native-updates desktop` to the existing setup command. Retain the same install
+root, native fallback path, state home, auth home, profile and other settings.
+The policy is retained by future AI Fence CLI updates. Other installations retain
+the default `--native-updates manual` policy.
+
+At each fresh app-server launch, the adapter finds the **running** Windows Store
+Codex app through its registered package identity. It compares that package's
+Windows runtime version with its bundled Linux runtime and copies the Linux
+Codex, code-mode host and ripgrep to a private immutable directory beside the
+adapter. The copy is independent of the Windows package, so a later Store cleanup
+cannot remove a running or retained runtime. Original binaries and previous
+runtime copies remain available.
+
+A new runtime must pass binary architecture, size, checksum and exact-version
+checks, the supported external-token schema checks, and the isolated native
+authentication bootstrap. Activation also preserves history/account identities,
+checkpoint approvals, installation channel and admission settings. Automatic
+downgrades are refused. `rollback` pauses both AI Fence and native automatic updates.
+A rollback that changes the native runtime requires all existing connections to
+close and verifies the previous native executable before selecting it.
+
+Native adoption requires the installation's lifecycle lock exclusively. If an
+existing connection is running, adoption waits for a future connection after the
+old connections close; no agent, turn or goal is interrupted. New connections
+re-read the selected runtime under the lifecycle lock before starting, preventing
+an old and new version from entering the same history during an update race.
+
+`codex-desktop update --check-only` also reports available native runtime updates.
+`codex-desktop update` can adopt one when no connection is running. Discovery or
+validation failures preserve the selected working runtime and produce a startup
+warning and `native-update-status.json`; `doctor` includes that status and the
+native policy. This mode requires WSL Windows interop and a uniquely identifiable
+running `OpenAI.Codex_2p2nqsd0c76g0` Store package. Other distributions and custom
+desktop builds require manual native selection.
 
 ## Native authentication and state
 
@@ -156,6 +195,70 @@ cannot immediately undo it. Re-enable auto through setup when ready. Native Code
 upgrades and changes to discovery/admission wrappers require explicit setup;
 auto-update will preserve modified or changed routers instead of overwriting them.
 Checksums identify release bytes; they are not a publisher signature.
+
+Shared-native upgrades also exercise the candidate CLI/proxy/bridge before
+activation, using a temporary history store and the selected native credential
+owner: `initialize`, legacy `getAuthStatus(includeToken=false,
+refreshToken=false)`, `initialized`, then `account/read(refreshToken=false)`.
+This check makes no model turn and copies no refresh tokens or histories.
+It retains the saved admission launcher. Run maintenance in an adequately
+admitted worker when the frontend has a smaller reservation; the check never
+raises caps or bypasses admission. A startup/admission timeout or process/resource
+failure defers the update, independently of authentication. The selected release,
+routers and previous settings remain unchanged on preflight failure. Candidate
+immutable files may remain staged. Profile-auth installations report this
+shared-owner check as `not_applicable`.
+
+`bootstrap-status.json` and update receipts record the release, native version,
+method/stage, timestamp and fixed classification. `doctor` separates proxy
+listening, successful native initialization, observed credential-owner auth,
+desktop protocol readiness and mobile observation. Initialization and auth replies
+establish readiness even if the client omits `initialized`; failed requests do
+not. A listening proxy or a successful models request alone does not establish
+desktop connection health. If the app cached a previous login-required screen,
+one client Restart/retry may still be needed after repair. Repeated service
+restarts or a fresh sign-in do not clear a client-side cache reliably.
+
+## Refresh CLI-configured MCP tools
+
+Use the owning adapter's narrow MCP control path to refresh tools without closing
+the desktop connection. It checks the installed native schema for
+`config/mcpServer/reload` and `mcpServerStatus/list` with `threadId` and
+`serverName`. Unsupported or older adapters report that explicitly. Upgrade and
+reconnect that adapter once when ready to enable the control path.
+
+Read `doctor` to select the exact adapter PID and a thread already loaded by it.
+Supply the configured MCP server name, rather than a plugin label:
+
+```bash
+ai-fence-cli codex-desktop --install-root /absolute/install/root mcp-refresh \
+  --pid ADAPTER_PID --thread-id LOADED_THREAD_ID --server-name CONFIGURED_SERVER \
+  --expect-tool resources.request:session_id,session_secret
+ai-fence-cli codex-desktop --install-root /absolute/install/root mcp-refresh --status
+```
+
+Add `--inspect-only` to inspect that thread's existing catalogue without reloading
+configuration. Repeat `--expect-tool NAME:ARG,ARG` to verify more tools. The
+operation waits for idle, pending inputs/requests/approvals and active turns,
+then expires after 30 seconds if it cannot complete. It checks idle again before
+reload, so a new turn arriving during the first status check defers the reload.
+Internal replies are consumed by the owning adapter. No separate app-server,
+arbitrary RPC, tool invocation, auth operation or resource lease is used.
+
+Reload acknowledges configuration refresh; it does not alone prove a new tool
+schema is loaded. `verified` means the selected thread's status exposes the
+expected tools and argument names; `schema_mismatch` preserves what is missing.
+Without expectations, `inspected` reports only the observed catalogue. A queued
+native refresh may take effect at the next normal turn; inspect again afterward
+if necessary. Tool argument names, required fields and schema hashes are retained;
+descriptions, schema defaults and raw error messages are omitted. Advertised
+server capabilities, the thread's observed catalogue, and the caller's valid
+Mission Control session remain separate: a verified catalogue does not register
+or borrow a session.
+
+Protocol reference: [Codex App Server](https://learn.chatgpt.com/docs/app-server).
+
+## Memory admission and pinned installations
 
 If the host already uses a memory/admission broker, supply its existing command
 prefix once during setup, LAST: `--launch-prefix /absolute/existing/launcher --`.

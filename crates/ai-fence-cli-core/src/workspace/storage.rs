@@ -154,7 +154,9 @@ pub(super) fn records(registry: &Registry) -> Result<Vec<Record>> {
 }
 
 pub(super) fn git(root: &Path, args: &[&str]) -> Result<Output> {
-    Command::new("git")
+    let mut command = Command::new("git");
+    super::repository::clear_git_environment(&mut command);
+    command
         .args([
             "-c",
             "core.fsmonitor=false",
@@ -398,6 +400,8 @@ impl Backend for Btrfs {
 struct Settings {
     format: String,
     directory: PathBuf,
+    #[serde(default)]
+    filesystem_id: Option<[u8; 16]>,
 }
 
 pub(super) fn project_key(project: &Identity) -> String {
@@ -426,12 +430,15 @@ impl Registry {
             &self.root.join("settings.json"),
             &Settings {
                 format: FORMAT.into(),
+                filesystem_id: Some(crate::workspace_snapshot::discovery::filesystem_id(
+                    &directory,
+                )?),
                 directory,
             },
         )
     }
 
-    fn directory(&self) -> Result<PathBuf> {
+    pub(super) fn directory(&self) -> Result<PathBuf> {
         let settings = self.root.join("settings.json");
         if settings.exists() {
             let settings: Settings = read_json(&settings)?;
@@ -440,6 +447,7 @@ impl Registry {
                 "unsupported workspace storage settings"
             );
             anyhow::ensure!(settings.directory.is_dir(), "configured workspace store is missing; mount/reconnect it before retrying (no fallback directory created)");
+            anyhow::ensure!(settings.filesystem_id == Some(crate::workspace_snapshot::discovery::filesystem_id(&settings.directory)?), "configured store filesystem changed or needs explicit reinitialization; no fallback created");
             return Ok(settings.directory);
         }
         Ok(self
@@ -478,7 +486,13 @@ impl Registry {
             anyhow::ensure!(directory.is_dir(), "saved workspace store is missing; mount/reconnect it or select --directory explicitly");
             return Ok(directory);
         }
-        self.directory()
+        let directory = self.directory()?;
+        if !self.root.join("settings.json").exists()
+            && crate::workspace_snapshot::discovery::filesystem_id(&project.path).is_ok()
+        {
+            return super::repository::automatic_directory(&project.path, &directory);
+        }
+        Ok(directory)
     }
 
     pub fn create(&self, name: &str, source: &Path, directory: Option<&Path>) -> Result<Record> {

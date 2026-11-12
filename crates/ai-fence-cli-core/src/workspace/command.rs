@@ -4,6 +4,11 @@ use std::process::Command;
 
 #[derive(Debug, Subcommand)]
 pub enum WorkspaceAction {
+    /// Manage clean repository bases and their immutable Btrfs generations.
+    Repo {
+        #[command(subcommand)]
+        action: RepositoryAction,
+    },
     /// Choose a workspace store once; place it on the project's Btrfs filesystem.
     Init {
         #[arg(long)]
@@ -162,6 +167,126 @@ pub enum WorkspaceAction {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum RepositoryAction {
+    Open {
+        remote: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        directory: Option<PathBuf>,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    Ensure {
+        id: String,
+        #[arg(long)]
+        remote: String,
+        #[arg(long)]
+        branch: String,
+        #[arg(long)]
+        directory: Option<PathBuf>,
+    },
+    Refresh {
+        id: String,
+    },
+    Prune {
+        id: String,
+        #[arg(long)]
+        apply: bool,
+    },
+    Status {
+        id: String,
+    },
+    Create {
+        id: String,
+        name: String,
+    },
+    Read {
+        id: String,
+        path: String,
+        #[arg(long, default_value_t = 1)]
+        start_line: usize,
+    },
+    List {
+        id: String,
+        #[arg(long, default_value = "")]
+        prefix: String,
+        #[arg(long, default_value = "")]
+        after: String,
+    },
+    Search {
+        id: String,
+        literal: String,
+        #[arg(long, default_value = "")]
+        prefix: String,
+    },
+}
+
+fn repository_action(registry: &Registry, action: RepositoryAction) -> Result<()> {
+    use RepositoryAction::*;
+    match action {
+        Open {
+            remote,
+            branch,
+            directory,
+            name,
+        } => {
+            let record = registry.repository_open(
+                remote.as_deref(),
+                branch.as_deref(),
+                directory.as_deref(),
+            )?;
+            if let Some(name) = name {
+                print_json(&registry.repository_workspace_latest(&record.id, &name)?)
+            } else {
+                print_json(&record)
+            }
+        }
+        Ensure {
+            id,
+            remote,
+            branch,
+            directory,
+        } => print_json(&registry.repository_ensure(
+            &id,
+            &remote,
+            &branch,
+            directory.as_deref(),
+            &[],
+        )?),
+        Refresh { id } => print_json(&registry.repository_refresh(&id, &[])?),
+        Prune { id, apply } => print_json(&registry.repository_prune(&id, 3, 900, apply)?),
+        Status { id } => print_json(&registry.repository(&id)?),
+        Create { id, name } => print_json(&registry.repository_workspace_latest(&id, &name)?),
+        Read {
+            id,
+            path,
+            start_line,
+        } => repository_query(registry, &id, source::Query::Read { path, start_line }),
+        List { id, prefix, after } => {
+            repository_query(registry, &id, source::Query::List { prefix, after })
+        }
+        Search {
+            id,
+            literal,
+            prefix,
+        } => repository_query(registry, &id, source::Query::Search { literal, prefix }),
+    }
+}
+
+fn repository_query(registry: &Registry, id: &str, query: source::Query) -> Result<()> {
+    let pin = uuid::Uuid::new_v4().to_string();
+    print_json(&registry.repository_source(
+        id,
+        None,
+        query,
+        "cli-read",
+        &pin,
+        chrono::Utc::now() + chrono::Duration::minutes(5),
+    )?)
+}
+
 fn print_json(value: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -276,6 +401,7 @@ pub fn execute(action: WorkspaceAction, entry_suffix: &[OsString]) -> Result<()>
             .unwrap_or(Registry::from_env()?)
     };
     match action {
+        WorkspaceAction::Repo { action } => repository_action(&registry, action),
         WorkspaceAction::Init { directory } => {
             registry.configure(&directory)?;
             eprintln!("Workspace storage: {}", directory.canonicalize()?.display());

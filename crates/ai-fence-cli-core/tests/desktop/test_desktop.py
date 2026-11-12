@@ -103,7 +103,7 @@ class DesktopTests(unittest.TestCase):
         def run(argv, **kwargs):
             calls.append((argv, kwargs))
             return SimpleNamespace(returncode=0, stdout=b'{"id":"af-fixture","path":"/fixture"}')
-        with patch.dict(os.environ, {"AI_FENCE_SNAPSHOT_ROOT": "/stale-startup-root"}), patch.object(desktop.subprocess, "run", side_effect=run):
+        with patch.dict(os.environ, {"AI_FENCE_SNAPSHOT_ROOT": "/stale-startup-root", "AI_FENCE_SNAPSHOTS": "auto"}), patch.object(desktop.subprocess, "run", side_effect=run):
             result = desktop.checkpoint(self.settings, self.project, "thread_checkpoint")
         self.assertEqual(result["id"], "af-fixture")
         self.assertIn(str(self.project), calls[0][0])

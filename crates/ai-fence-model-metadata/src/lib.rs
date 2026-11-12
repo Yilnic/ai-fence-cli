@@ -586,6 +586,27 @@ pub fn resolve_from_litellm_catalog_with_source(
 pub fn litellm_lookup_keys(model: &str) -> Vec<String> {
     let mut keys = Vec::new();
     push_key(&mut keys, model);
+    // Fence's route namespaces are not necessarily LiteLLM catalog keys.
+    // Keep an exact catalog entry authoritative, then look up the provider's
+    // native model name. Never strip arbitrary namespaces: those can identify
+    // different providers with different capabilities and prices.
+    for prefix in [
+        "openai/",
+        "anthropic/",
+        "jetbrains/completions/",
+        "jetbrains/anthropic/",
+    ] {
+        if let Some(rest) = model.strip_prefix(prefix) {
+            push_key(&mut keys, rest);
+        }
+    }
+    // OpenRouter's catalog retains the provider namespace, but does not use
+    // Fence's wire-format segment. Do not borrow direct-provider prices.
+    for prefix in ["openrouter/completions/", "openrouter/anthropic/"] {
+        if let Some(rest) = model.strip_prefix(prefix) {
+            push_key(&mut keys, &format!("openrouter/{rest}"));
+        }
+    }
     if let Some(rest) = model.strip_prefix("zai-anthropic/") {
         push_key(&mut keys, &format!("zai/{rest}"));
         push_key(&mut keys, rest);
@@ -759,6 +780,78 @@ mod tests {
         assert_eq!(resolved.metadata.max_output_tokens, Some(128000));
         assert_eq!(resolved.pricing.cost_per_million_input_tokens, Some(0.6));
         assert_eq!(resolved.pricing.cost_per_million_output_tokens, Some(2.2));
+    }
+
+    #[test]
+    fn litellm_metadata_resolves_configured_provider_and_transport_namespaces() {
+        let catalog = json!({
+            "gpt-current": {
+                "litellm_provider": "openai", "mode": "chat",
+                "supports_function_calling": true,
+                "input_cost_per_token": 0.000002, "output_cost_per_token": 0.000008
+            },
+            "claude-current": {
+                "litellm_provider": "anthropic", "mode": "chat",
+                "supports_function_calling": true,
+                "input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015
+            },
+            "openrouter/anthropic/claude-current": {
+                "litellm_provider": "openrouter", "mode": "chat",
+                "supports_function_calling": true,
+                "input_cost_per_token": 0.000004, "output_cost_per_token": 0.000020
+            }
+        });
+        for (model, provider, input, output) in [
+            ("openai/gpt-current", "openai", 2.0, 8.0),
+            ("anthropic/claude-current", "anthropic", 3.0, 15.0),
+            ("jetbrains/completions/gpt-current", "openai", 2.0, 8.0),
+            ("jetbrains/anthropic/claude-current", "anthropic", 3.0, 15.0),
+            (
+                "openrouter/completions/anthropic/claude-current",
+                "openrouter",
+                4.0,
+                20.0,
+            ),
+            (
+                "openrouter/anthropic/anthropic/claude-current",
+                "openrouter",
+                4.0,
+                20.0,
+            ),
+        ] {
+            let resolved = resolve_from_litellm_catalog(model, &catalog).expect(model);
+            assert_eq!(resolved.model, model);
+            assert_eq!(resolved.metadata.provider.as_deref(), Some(provider));
+            assert_eq!(resolved.metadata.supports_tools, Some(true));
+            assert_eq!(resolved.pricing.cost_per_million_input_tokens, Some(input));
+            assert_eq!(
+                resolved.pricing.cost_per_million_output_tokens,
+                Some(output)
+            );
+        }
+        assert!(resolve_from_litellm_catalog("unrelated/gpt-current", &catalog).is_none());
+        assert!(
+            resolve_from_litellm_catalog("openrouter/completions/claude-current", &catalog)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn litellm_exact_route_metadata_precedes_namespace_fallback() {
+        let catalog = json!({
+            "openai/gpt-current": {
+                "mode": "embedding", "supports_function_calling": false,
+                "input_cost_per_token": 0.000007, "output_cost_per_token": 0.0
+            },
+            "gpt-current": {
+                "mode": "chat", "supports_function_calling": true,
+                "input_cost_per_token": 0.000002, "output_cost_per_token": 0.000008
+            }
+        });
+        let resolved = resolve_from_litellm_catalog("openai/gpt-current", &catalog).unwrap();
+        assert_eq!(resolved.metadata.mode.as_deref(), Some("embedding"));
+        assert_eq!(resolved.metadata.supports_tools, Some(false));
+        assert_eq!(resolved.pricing.cost_per_million_input_tokens, Some(7.0));
     }
 
     #[test]

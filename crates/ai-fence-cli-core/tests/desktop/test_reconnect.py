@@ -142,6 +142,56 @@ class ReconnectTests(unittest.TestCase):
         session.client(dict(method="initialized"))
         self.assertTrue(session.poll())
 
+    def test_protocol_activity_can_open_reconnect_gate_without_initialized(self):
+        root = Path(self.settings["install_root"])
+        self.settings.update(release="new", cli_sha256="fixture", files={})
+        root.mkdir(exist_ok=True)
+        desktop.save(root / "settings.json", self.settings)
+        live = root / "launches" / (str(os.getpid()) + ".json")
+        desktop.save(live, dict(format=1, **self.lease, mode="desktop-stdio", fenced=True,
+                               profile=self.settings["profile"], state_home=self.settings["state_home"],
+                               release="old", cli_sha256="old"))
+        lifecycle = SimpleNamespace(threads={"thread_a", "thread_b"})
+        session = desktop.ReconnectSession(self.settings, live, lifecycle)
+        session.client(dict(id=1, method="initialize"))
+        session.native(dict(id=1, result={}))
+        session.ready = False
+        self.schedule()
+        self.assertFalse(session.poll())
+        session.client(dict(id=1, method="config/read"))
+        session.native(dict(id=1, result={}))
+        self.assertTrue(session.poll())
+
+    def test_failed_initialization_or_protocol_error_cannot_establish_readiness(self):
+        root, live, session = self.session()
+        session.ready = False
+        session.initialize_ok = False
+        session.client(dict(id=2, method="config/read"))
+        session.native(dict(id=2, result={}))
+        self.schedule()
+        self.assertFalse(session.poll())
+        session.initialize_ok = True
+        session.protocol_ready = False
+        session.client(dict(id=3, method="config/read"))
+        session.native(dict(id=3, error=dict(code=-32601)))
+        self.assertFalse(session.poll())
+
+    def test_shared_owner_auth_is_observed_even_without_initialized_notification(self):
+        root, live, session = self.session()
+        session.settings["auth_mode"] = "native-owner"
+        desktop.save(root / "settings.json", session.settings)
+        session.ready = False
+        session.owner_auth = "unknown"
+        session.client(dict(id=2, method="getAuthStatus"))
+        session.native(dict(id=2, error=dict(code=-32001, message="SECRET")))
+        self.schedule()
+        self.assertFalse(session.poll())
+        session.client(dict(id=3, method="getAuthStatus"))
+        session.native(dict(id=3, result=dict(authMethod="chatgpt")))
+        self.assertTrue(desktop.load(live)["reconnect_state"]["ready"])
+        self.assertTrue(session.poll())
+        self.assertNotIn("SECRET", live.read_text())
+
     def test_update_failure_and_check_only_never_schedule_reconnect(self):
         root, live, session = self.session()
         arguments = ["--install-root", str(root), "update"]

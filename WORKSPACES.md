@@ -9,6 +9,44 @@ uncommitted changes and untracked files. Ordinary resume never resets or
 recreates that directory. Read-only recovery checkpoints are a separate,
 optional feature and default to **off**.
 
+## Managed repository bases
+
+With a matching workspace-aware build, run this from an existing Git project:
+
+```bash
+ai-fence-workspace repo open --name feature-a
+```
+
+Fence infers the remote and its default branch, chooses private writable Btrfs
+storage on the project's filesystem, and remembers a stable repository ID.
+You can also pass a remote URL and `--branch` explicitly. The store can live
+on any mounted Btrfs filesystem; no `/home` layout is required. Ambiguous or
+unavailable storage requires an explicit `--directory` choice. Fence never
+formats, mounts, elevates or relocates an active checkout.
+
+The engine maintains a clean `master` checkout (the role name, regardless of
+the actual upstream branch), fetches and fast-forwards it, then publishes a
+read-only generation. New named workspaces use a refreshed generation; resuming
+an existing name preserves its files, Git state and native history. Each copy
+has a complete independent `.git`, with Btrfs sharing unchanged data blocks.
+Dirty masters and non-fast-forward upstream changes refuse refresh while the
+last published generation stays readable. Normal failed initial clones clean
+their fresh managed subvolume; uncertain crash leftovers require inspection.
+
+`repo status ID` identifies the published commit and capture time. `repo list`,
+`repo read` and `repo search` provide bounded committed-source views, excluding
+Git configuration, symlinks and sensitive paths. The library also supports
+generation change lists and finite consumer-owned source leases. These leases
+are independent of recovery checkpoint pins. `repo prune ID` previews old
+unleased base cleanup; add `--apply` to remove eligible generations. Writable
+workspaces and recovery checkpoints are preserved. Deleting an old base does
+not invalidate its independent workspace snapshots.
+
+The public engine knows repositories, storage principals, generations and
+leases. Applications provide their own authentication and authorization around
+it. Separate system accounts use private stores by default; sharing a
+human-owned store requires an explicit owner association.
+
 ## Why we recommend Btrfs
 
 Btrfs creates writable copy-on-write snapshots quickly without initially

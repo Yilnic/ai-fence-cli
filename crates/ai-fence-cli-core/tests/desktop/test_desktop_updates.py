@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import platform
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -33,6 +34,7 @@ class UpdateTests(unittest.TestCase):
             return io.BytesIO(json.dumps(manifest).encode() if "manifest" in request.full_url else binary + (b"X" if tamper else b""))
         def run(argv, **kwargs):
             calls.append(argv)
+            self.assertEqual(kwargs.get("stdin"), subprocess.DEVNULL)
             if "setup" in argv:
                 prepared = dict(self.settings, cli_version="0.1.9", cli_sha256=manifest["sha256"], release="new")
                 (Path(argv[argv.index("--prepare-only") + 1]) / "settings.json").write_text(json.dumps(prepared))

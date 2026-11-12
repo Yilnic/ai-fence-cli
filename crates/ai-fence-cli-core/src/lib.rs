@@ -4,6 +4,7 @@ pub mod config;
 pub mod open_interpreter;
 pub mod openclaw;
 pub mod proxy;
+pub mod windows_proxy;
 pub mod workspace;
 pub mod workspace_snapshot;
 
@@ -36,6 +37,7 @@ mod boundary_tests {
             include_str!("workspace_snapshot/command.rs"),
             include_str!("workspace_snapshot/discovery.rs"),
             include_str!("workspace_snapshot/sets.rs"),
+            include_str!("windows_proxy.rs"),
             include_str!("bin/ai-fence-snapshot.rs"),
             include_str!("../assets/codex_desktop.py"),
             include_str!("../assets/codex_desktop_auth.py"),

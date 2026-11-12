@@ -1,0 +1,24 @@
+{
+  "repository": "Yilnic/ai-fence-cli",
+  "version": "0.1.15",
+  "artifacts": {
+    "linux-x86_64": {
+      "filename": "ai-fence-cli-linux-x86_64",
+      "source_url": "https://ai.yaaf.de/downloads/candidate/ai-fence-cli-linux-x86_64",
+      "sha256": "5a7f9e9b9035115115065fb582c4d0079cbdfc0eb52d1f558fa48b573cf0a480",
+      "size_bytes": 58864488
+    },
+    "windows-x86_64": {
+      "filename": "ai-fence-cli-windows-x86_64.exe",
+      "source_url": "https://ai.yaaf.de/downloads/candidate/ai-fence-cli-windows-x86_64.exe",
+      "sha256": "5db9593c076320fdfd69799fa151453fb7372fd07b152f02abdd6d10d881e590",
+      "size_bytes": 73201419
+    },
+    "macos-aarch64": {
+      "filename": "ai-fence-cli-macos-aarch64",
+      "source_url": "https://ai.yaaf.de/downloads/candidate/ai-fence-cli-macos-aarch64",
+      "sha256": "3b67f11e296f4b7aacdb789c3330f402d67842143cd6c8c00034fdb30e87dfe3",
+      "size_bytes": 50099520
+    }
+  }
+}

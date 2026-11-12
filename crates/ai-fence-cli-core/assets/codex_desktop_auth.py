@@ -5,6 +5,7 @@ desktop client. All login/refresh operations use the native account API in the
 explicit credential home. Requires native file storage and external-token API.
 """
 import hashlib
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -51,11 +52,68 @@ def directory_identity(home):
         raise AuthError("Credential home is missing; reattach its filesystem without creating a replacement") from None
     if not stat.S_ISDIR(info.st_mode):
         raise AuthError("Credential home must be a directory")
-    return dict(device=info.st_dev, inode=info.st_ino)
+    identity = dict(device=info.st_dev, inode=info.st_ino)
+    subvolume = subvolume_uuid(home)
+    if subvolume:
+        identity["subvolume_uuid"] = subvolume
+    return identity
+
+
+def subvolume_uuid(path):
+    try:
+        buffer = bytearray(504)
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.ioctl(descriptor, 0x81F8943C, buffer, True)
+        finally:
+            os.close(descriptor)
+        value = uuid.UUID(bytes=bytes(buffer[296:312]))
+        return str(value)
+    except (OSError, ValueError):
+        return None
+
+
+def persistent_subvolume(value):
+    try:
+        return bool(uuid.UUID(value).int)
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def same_identity(expected, actual):
+    """Btrfs st_dev is allocated again on mount; its subvolume UUID is durable."""
+    if expected == actual:
+        return True
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return False
+    if not persistent_subvolume(expected.get("subvolume_uuid")) or expected["subvolume_uuid"] != actual.get("subvolume_uuid"):
+        return False
+    return ({k: v for k, v in expected.items() if k != "device"}
+            == {k: v for k, v in actual.items() if k != "device"})
+
+
+def same_auth_identity(settings, actual):
+    expected = settings.get("auth_identity")
+    if same_identity(expected, actual):
+        return True
+    if (isinstance(expected, dict) and set(expected) == {"device", "inode"}
+            and all(expected[key] == actual.get(key) for key in expected)):
+        return True
+    # Older installations stored only st_dev/inode for credentials. Upgrade
+    # that proof only when the saved history UUID also identifies this exact
+    # subvolume, the history directory still matches, and auth's inode agrees.
+    state = settings.get("state_identity", {})
+    if (not isinstance(expected, dict) or set(expected) != {"device", "inode"}
+            or expected["inode"] != actual.get("inode")
+            or not persistent_subvolume(state.get("subvolume_uuid"))
+            or state["subvolume_uuid"] != actual.get("subvolume_uuid")):
+        return False
+    saved_state = {k: v for k, v in state.items() if k != "physical"}
+    return same_identity(saved_state, directory_identity(settings["state_home"]))
 
 
 def validate_home(settings):
-    if settings.get("auth_identity") and directory_identity(settings["auth_home"]) != settings["auth_identity"]:
+    if settings.get("auth_identity") and not same_auth_identity(settings, directory_identity(settings["auth_home"])):
         raise AuthError("Credential home identity changed; select it explicitly after inspecting the account")
 
 
@@ -178,7 +236,7 @@ class NativeOwner:
             try:
                 response = result.get(timeout=6)
             except queue.Empty:
-                raise AuthError("Native authentication operation timed out; retry sign-in explicitly") from None
+                raise AuthError("Native authentication operation timed out; retry the connection after storage/resources recover") from None
             if response is None:
                 raise AuthError("Native credential owner disconnected during authentication")
             if "error" in response:
@@ -281,7 +339,11 @@ class Bridge:
         return bool(tokens)
 
     def client(self, value):
-        if not value.get("method", "").startswith("account/") or "id" not in value:
+        method = value.get("method", "")
+        # Desktop bootstraps authentication through this legacy API, before
+        # requesting account/read. Its status must come from the native owner,
+        # never the intentionally empty ephemeral history-process store.
+        if (not method.startswith("account/") and method != "getAuthStatus") or "id" not in value:
             return False
         try:
             if value["method"] == "account/login/start" and (value.get("params") or {}).get("type") not in {"chatgpt", "chatgptDeviceCode"}:
@@ -290,7 +352,7 @@ class Bridge:
             if value["method"] == "account/logout":
                 self.runtime_call("account/logout", {})
                 self.current = None
-            elif value["method"] == "account/read":
+            elif value["method"] in {"account/read", "getAuthStatus"}:
                 self.sync()
             self.client_send(dict(id=value["id"], result=result))
         except (AuthError, OSError) as error:
@@ -300,7 +362,7 @@ class Bridge:
     @staticmethod
     def error(identifier, error=None):
         return dict(id=identifier, error=dict(code=getattr(error, "code", -32001),
-            message="AI Fence authentication: " + (str(error) if isinstance(error, AuthError) else "sign in to the selected credential home"),
+            message="AI Fence authentication: " + (str(error) if isinstance(error, AuthError) else "credential owner unavailable; retry the connection after storage/resources recover"),
             data=dict(origin="ai_fence", stage="auth_owner", retryable=False)))
 
     def runtime(self, value):

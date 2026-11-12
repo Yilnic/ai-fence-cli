@@ -10,6 +10,7 @@ if sys.platform != "linux" or sys.version_info < (3, 11):
     raise SystemExit(2)
 
 import argparse
+from collections import deque
 import contextlib
 import fcntl
 import hashlib
@@ -38,6 +39,7 @@ _auth_spec = importlib.util.spec_from_file_location("ai_fence_codex_auth", Path(
 auth_runtime = importlib.util.module_from_spec(_auth_spec)
 _auth_spec.loader.exec_module(auth_runtime)
 auth_policy = auth_runtime.policy
+same_identity = auth_runtime.same_identity
 _update_spec = importlib.util.spec_from_file_location("ai_fence_codex_updates", Path(__file__).with_name("codex_desktop_updates.py"))
 updates = importlib.util.module_from_spec(_update_spec)
 _update_spec.loader.exec_module(updates)
@@ -277,7 +279,7 @@ def update_registered(source_base_url):
     for entry in entries:
         root = Path(entry["install_root"])
         try:
-            if not root.is_dir() or identity(root) != entry["identity"] or not (root / "settings.json").is_file():
+            if not root.is_dir() or not same_identity(entry["identity"], identity(root)) or not (root / "settings.json").is_file():
                 results.append(dict(install_root=str(root), status="missing_or_replaced"))
                 continue
             trusted(root / "settings.json")
@@ -315,7 +317,7 @@ def install(args):
     root = root.resolve()
     if root.stat().st_mode & 0o022:
         fail("install root must not be group/other writable")
-    with lock(root / ".install.lock"):
+    with lock(root / ".install.lock"), contextlib.ExitStack() as cleanup:
         native = trusted(args.native_codex, True)
         cli = trusted(os.environ["AI_FENCE_DESKTOP_CLI_SOURCE"], True)
         if native.is_relative_to(root) or native == cli:
@@ -335,7 +337,8 @@ def install(args):
         selected_channel, update_base = setup_channel_options(args, old)
         updates.safe_url(update_base)
         prepared = getattr(args, "prepare_only", None)
-        destination = Path(prepared).resolve() if prepared else root
+        destination = Path(prepared).resolve() if prepared else Path(cleanup.enter_context(
+            tempfile.TemporaryDirectory(prefix=".setup-stage-", dir=root)))
         destination.mkdir(parents=True, exist_ok=True, mode=0o700)
         if prepared and (destination == root or any(destination.iterdir())):
             fail("update preparation requires an empty private staging directory")
@@ -359,7 +362,7 @@ def install(args):
         if old and (old["state_home"] != str(home) or old["profile"] != args.profile):
             fail("upgrade cannot change profile/state-home identity; use a separate installation")
         if old:
-            if not home.is_dir() or identity(home) != old["state_identity"]:
+            if not home.is_dir() or not same_identity(old["state_identity"], identity(home)):
                 fail("installed state home is missing or replaced; reattach its filesystem without creating a replacement")
         else:
             home.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -371,17 +374,28 @@ def install(args):
         auth = auth_policy(home, Path(selected_auth).expanduser(), expected_key=(old or {}).get("auth_account_key"))
         if old and old.get("auth_account_key") and auth.get("auth_account_key") != old["auth_account_key"]:
             fail("upgrade cannot change the credential account bound to existing history")
-        if auth["auth_mode"] == "native-owner":
-            with tempfile.TemporaryDirectory(prefix="af-codex-schema-") as schema:
-                probe_env = os.environ.copy()
-                probe_env["CODEX_HOME"] = schema
-                probe = subprocess.run([str(native), "app-server", "generate-json-schema", "--out", schema],
-                                       env=probe_env, capture_output=True, timeout=15)
-                login_schema = Path(schema) / "v2/LoginAccountParams.json"
-                if (probe.returncode or not login_schema.is_file() or
-                        '"chatgptAuthTokens"' not in login_schema.read_text() or
-                        not (Path(schema) / "ChatgptAuthTokensRefreshResponse.json").exists()):
-                    fail("native Codex lacks the external-token login/refresh API; update native Codex or select profile auth")
+        native_updates = getattr(args, "native_updates", None) or (old or {}).get("native_updates", "manual")
+        if native_updates == "desktop" and auth["auth_mode"] != "native-owner":
+            fail("desktop native updates require shared native authentication for candidate validation")
+        mcp_protocol = dict(reload=False, thread_status=False)
+        with tempfile.TemporaryDirectory(prefix="af-codex-schema-") as schema:
+            probe_env = os.environ.copy()
+            probe_env["CODEX_HOME"] = schema
+            probe = subprocess.run([str(native), "app-server", "generate-json-schema", "--out", schema],
+                                   env=probe_env, capture_output=True, timeout=15)
+            login_schema = Path(schema) / "v2/LoginAccountParams.json"
+            if auth["auth_mode"] == "native-owner" and (probe.returncode or not login_schema.is_file() or
+                    '"chatgptAuthTokens"' not in login_schema.read_text() or
+                    not (Path(schema) / "ChatgptAuthTokensRefreshResponse.json").exists()):
+                fail("native Codex lacks the external-token login/refresh API; update native Codex or select profile auth")
+            request_schema = Path(schema) / "ClientRequest.json"
+            if probe.returncode == 0 and request_schema.is_file():
+                requests = request_schema.read_text()
+                status_schemas = list(Path(schema).glob("v2/*Mcp*Status*Params.json"))
+                mcp_protocol = dict(reload='"config/mcpServer/reload"' in requests,
+                    thread_status='"mcpServerStatus/list"' in requests and
+                    any('"threadId"' in path.read_text() and '"serverName"' in path.read_text() for path in status_schemas),
+                    tools_only=any('"toolsAndAuthOnly"' in path.read_text() for path in status_schemas))
         if args.snapshots != "off" and args.approve_root and not args.snapshot_directory:
             fail("approved roots require --snapshot-directory on the same Btrfs filesystem")
         files = {}
@@ -447,19 +461,33 @@ def install(args):
                         snapshot_directory=str(args.snapshot_directory.expanduser().absolute()) if args.snapshot_directory else None,
                         files=files, launch_prefix=launch_prefix, cli_version=cli_version, cli_sha256=digest(cli),
                         update_policy=getattr(args, "updates", None) or (old or {}).get("update_policy", "auto"),
+                        native_updates=native_updates,
                         reconnect_policy=getattr(args, "reconnect", None) or (old or {}).get("reconnect_policy", "auto"),
                         update_base_url=update_base,
-                        update_interval_seconds=getattr(args, "update_interval_seconds", None) or (old or {}).get("update_interval_seconds", 86400), **auth)
+                        update_interval_seconds=getattr(args, "update_interval_seconds", None) or (old or {}).get("update_interval_seconds", 86400),
+                        mcp_protocol=mcp_protocol, **auth)
         updates.safe_url(settings["update_base_url"])
         if settings["snapshot_policy"] != "off" and settings["roots"] and not settings["snapshot_directory"]:
             fail("approved roots require --snapshot-directory on the same Btrfs filesystem")
         save(destination / "snapshot-roots.json", dict(format=FORMAT, roots=settings["roots"]))
         if old and old != settings and not prepared:
+            try:
+                report = updates.require_bootstrap(settings)
+            except updates.CandidateError as error:
+                save(root / "bootstrap-status.json", error.report)
+                fail("candidate desktop bootstrap failed: " + error.report["classification"] +
+                     "; previous release remains selected; inspect bootstrap-status.json")
+            save(root / "bootstrap-status.json", report)
             save(root / "previous-settings.json", old)
         if args.snapshots != "off" and not prepared:
             install_guidance(home)
         # This is the only release switch; existing children retain old settings.
-        save(destination / "settings.json", settings)
+        if not prepared:
+            for name in files:
+                if not name.startswith("releases/"):
+                    atomic(root / name, (destination / name).read_bytes(), 0o700)
+            atomic(root / "snapshot-roots.json", (destination / "snapshot-roots.json").read_bytes())
+        save((destination if prepared else root) / "settings.json", settings)
         if not prepared:
             try:
                 register_installation(settings)
@@ -507,7 +535,7 @@ def named_context(settings, cwd):
 
 def same_named_identity(expected, path):
     actual = identity(path)
-    if expected.get("subvolume_uuid"):
+    if auth_runtime.persistent_subvolume(expected.get("subvolume_uuid")):
         return expected["subvolume_uuid"] == actual["subvolume_uuid"] and expected["inode"] == actual["inode"]
     return (expected["device"], expected["inode"]) == (actual["device"], actual["inode"])
 
@@ -562,7 +590,7 @@ def wait_for_payloads(settings):
     while True:
         try:
             if (Path(settings["native_codex"]).is_file() and
-                    identity(settings["state_home"]) == settings.get("state_identity", identity(settings["state_home"]))):
+                    same_identity(settings.get("state_identity", identity(settings["state_home"])), identity(settings["state_home"]))):
                 return
         except OSError:
             pass
@@ -699,17 +727,7 @@ def alive(lease):
 def identity(path):
     path = Path(path).resolve(strict=True)
     info = path.stat()
-    subvolume = None
-    try:
-        buffer = bytearray(504)
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            fcntl.ioctl(fd, 0x81F8943C, buffer, True)
-        finally:
-            os.close(fd)
-        subvolume = str(uuid.UUID(bytes=bytes(buffer[296:312])))
-    except (OSError, ValueError):
-        pass
+    subvolume = auth_runtime.subvolume_uuid(path)
     return {"physical": str(path), "device": info.st_dev, "inode": info.st_ino, "subvolume_uuid": subvolume}
 
 
@@ -727,7 +745,7 @@ def attach(settings, thread_id, cwd, lease, checkpoint=None, mode="checkpoint", 
             record = load(path)
             if not Path(record["workspace"]["physical"]).exists():
                 fail("saved workspace is missing; recover to a new workspace from a chosen checkpoint or explicitly adopt a replacement")
-            if record["workspace"] != project and not (named and record.get("named_workspace", {}).get("id") == named["id"]):
+            if not same_identity(record["workspace"], project) and not (named and record.get("named_workspace", {}).get("id") == named["id"]):
                 fail("resume requested another workspace; explicit adoption/recovery is required")
             if record["profile"] != settings["profile"] or record["state_home"] != settings["state_home"]:
                 fail("profile/state-home identity mismatch")
@@ -803,15 +821,15 @@ def preflight_resume(settings, parameters):
             fail("thread already has an active workspace lease")
         if not current.exists():
             fail("saved workspace is missing; use workspace recovery/adoption explicitly, no fallback performed")
-        if identity(current) != record["workspace"]:
+        if not same_identity(record["workspace"], identity(current)):
             fail("saved workspace physical identity changed; explicit recovery is required")
-        if parameters.get("cwd") and identity(parameters["cwd"]) != record["workspace"]:
+        if parameters.get("cwd") and not same_identity(record["workspace"], identity(parameters["cwd"])):
             fail("resume cwd differs from the saved workspace; explicit adoption is required")
         # Retain the caller's alias, or the original checkpoint-mode logical cwd.
         # An isolated/adopted workspace uses its saved physical destination.
         if not parameters.get("cwd"):
             logical = Path(record.get("logical_root", current))
-            if record["mode"] == "checkpoint" and logical.exists() and identity(logical) == record["workspace"]:
+            if record["mode"] == "checkpoint" and logical.exists() and same_identity(record["workspace"], identity(logical)):
                 parameters["cwd"] = str(logical)
             else:
                 parameters["cwd"] = str(current)
@@ -1079,6 +1097,224 @@ def reconnect(settings, apply=False, status=False, cancel=False, pid=None, wait_
             return request
 
 
+def mcp_refresh(settings, pid=None, thread_id=None, server_name=None, inspect_only=False, status=False, expected=None):
+    """One typed operation, addressed to an exact existing adapter instance."""
+    root = Path(settings["install_root"])
+    request_path, report_path = root / "mcp-refresh-request.json", root / "mcp-refresh-status.json"
+    with lock(root / ".mcp-refresh.lock"):
+        previous = load(report_path) if report_path.exists() else None
+        if status:
+            if previous and previous.get("status") in {"queued", "reloading", "listing"} and previous.get("expires_at", 0) < time.time():
+                return dict(previous, status="expired", classification="operation_expired")
+            return previous or dict(format=FORMAT, status="none")
+        if not isinstance(pid, int) or not isinstance(thread_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", thread_id):
+            fail("MCP refresh requires an exact adapter PID and loaded thread ID")
+        if not isinstance(server_name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", server_name):
+            fail("MCP refresh requires the configured server name")
+        if expected and (len(expected) > 32 or any(not re.fullmatch(r"[A-Za-z0-9_./:-]{1,160}", name)
+                or len(arguments) > 64 or any(not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", arg) for arg in arguments)
+                for name, arguments in expected.items())):
+            fail("invalid expected MCP tool arguments")
+        live = load(root / "launches" / (str(pid) + ".json"))
+        if (not alive(live) or live.get("profile") != settings["profile"] or live.get("state_home") != settings["state_home"]
+                or live.get("mode") != "desktop-stdio" or live.get("mcp_refresh_control") != 1):
+            fail("selected connection does not support MCP refresh; reconnect its adapter once after upgrade")
+        if thread_id not in live.get("reconnect_state", {}).get("threads", []):
+            fail("thread is not loaded by the selected connection; choose its owning adapter")
+        if previous and previous.get("status") in {"queued", "reloading", "listing"} and previous.get("expires_at", 0) > time.time():
+            fail("an MCP operation is already pending; inspect mcp-refresh --status")
+        request = dict(format=FORMAT, operation_id=uuid.uuid4().hex, status="queued", created_at=time.time(),
+                       expires_at=time.time() + 30, pid=pid, start=live["start"], release=live["release"],
+                       profile=settings["profile"], state_home=settings["state_home"], thread_id=thread_id,
+                       server_name=server_name, inspect_only=inspect_only, expected_tools=expected or {})
+        save(report_path, request)
+        save(request_path, request)
+        return request
+
+
+class McpRefreshSession:
+    """The owning stdio adapter alone sends/consumes these two internal RPCs.
+
+    No arbitrary methods, auth operations, tool calls or resource leases. Work
+    starts only at idle and shares the adapter's input/reconnect serialization.
+    """
+    def __init__(self, settings, reconnect, native_send):
+        self.settings, self.reconnect, self.native_send = settings, reconnect, native_send
+        self.root = Path(settings["install_root"])
+        self.request, self.pending, self.seen = None, None, deque(maxlen=64)
+        self.servers, self.cursors, self.pages = [], set(), 0
+        with lock(reconnect.live.with_suffix(".lock")):
+            item = load(reconnect.live)
+            item["mcp_refresh_control"] = 1
+            save(reconnect.live, item)
+
+    def mark(self, status, **values):
+        self.request.update(status=status, updated_at=time.time(), **values)
+        try:
+            with lock(self.root / ".mcp-refresh.lock"):
+                path = self.root / "mcp-refresh-status.json"
+                current = load(path)
+                if current.get("operation_id") == self.request["operation_id"]:
+                    save(path, self.request)
+                    return True
+        except (OSError, ValueError, RuntimeError, KeyError):
+            pass
+        return False
+
+    def finish(self, status, **values):
+        if self.pending:
+            key = json.dumps(self.pending[0])
+            self.reconnect.pending.pop(key, None)
+            self.pending = None
+        self.reconnect.control_active = False
+        self.mark(status, **values)
+        try:
+            self.reconnect.publish()
+        except (OSError, ValueError, RuntimeError):
+            pass
+        self.request = None
+
+    def call(self, method, params):
+        identifier = "af_mcp_refresh_" + uuid.uuid4().hex
+        self.pending = (identifier, method)
+        value = dict(id=identifier, method=method, params=params)
+        self.reconnect.client(value)
+        self.native_send(value)
+
+    def list_tools(self, cursor=None):
+        params = dict(threadId=self.request["thread_id"], serverName=self.request["server_name"], limit=50)
+        if self.settings.get("mcp_protocol", {}).get("tools_only"):
+            params["detail"] = "toolsAndAuthOnly"
+        if cursor is not None:
+            params["cursor"] = cursor
+        if self.mark("listing"):
+            self.call("mcpServerStatus/list", params)
+        else:
+            self.finish("failed", classification="control_receipt_unavailable")
+
+    def poll(self):
+        with self.reconnect.gate:
+            if self.request:
+                if time.time() > self.request["expires_at"]:
+                    self.finish("expired", classification="protocol_timeout")
+                elif self.request.get("stage") == "reload_pending" and self.idle():
+                    self.request["stage"] = "reload"
+                    if self.mark("reloading"):
+                        self.call("config/mcpServer/reload", {})
+                    else:
+                        self.finish("failed", classification="control_receipt_unavailable")
+                return
+            path = self.root / "mcp-refresh-request.json"
+            if not path.exists() or path.stat().st_size > 16384:
+                return
+            request = load(path)
+            operation = request.get("operation_id")
+            if (not isinstance(operation, str) or operation in self.seen
+                    or not re.fullmatch(r"[0-9a-f]{32}", operation)):
+                return
+            if (request.get("pid"), request.get("start"), request.get("release")) != (
+                    self.reconnect.lease["pid"], self.reconnect.lease["start"], self.settings["release"]):
+                return
+            if request.get("profile") != self.settings["profile"] or request.get("state_home") != self.settings["state_home"]:
+                return
+            self.request = request
+            if time.time() > request["expires_at"]:
+                self.seen.append(operation)
+                self.finish("expired", classification="idle_wait_expired")
+                return
+            if request.get("thread_id") not in self.reconnect.lifecycle.threads:
+                self.seen.append(operation)
+                self.finish("failed", classification="thread_not_owned")
+                return
+            if not self.idle():
+                self.request = None
+                return
+            self.seen.append(operation)
+            protocol = self.settings.get("mcp_protocol", {})
+            if not protocol.get("reload") or not protocol.get("thread_status"):
+                self.finish("unsupported", classification="native_protocol_not_verified")
+                return
+            self.servers, self.cursors, self.pages = [], set(), 0
+            self.reconnect.control_active = True
+            # First verify the loaded thread's status API. Unknown or unloaded
+            # threads fail before configuration reload is attempted.
+            self.list_tools()
+
+    def idle(self):
+        session = self.reconnect
+        return session.usable() and not (session.draining or session.inputs or session.pending or session.approvals or session.active)
+
+    def native(self, value):
+        identifier = value.get("id")
+        if not self.pending or identifier != self.pending[0] or "method" in value:
+            return isinstance(identifier, str) and identifier.startswith("af_mcp_refresh_") and "method" not in value
+        with self.reconnect.gate:
+            method = self.pending[1]
+            if not isinstance(value.get("result"), dict) and not isinstance(value.get("error"), dict):
+                self.finish("failed", classification="native_status_invalid")
+                return True
+            self.reconnect.native(dict(id=identifier, error={}) if "error" in value else value)
+            self.pending = None
+            if time.time() > self.request["expires_at"]:
+                self.finish("expired", classification="protocol_timeout")
+                return True
+            if "error" in value:
+                code = value["error"].get("code") if isinstance(value["error"], dict) else None
+                self.finish("unsupported" if code == -32601 else "failed", classification="native_rpc_rejected")
+                return True
+            if method == "config/mcpServer/reload":
+                self.request["reload_acknowledged"] = True
+                self.list_tools()
+                return True
+            result = value.get("result")
+            if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+                self.finish("failed", classification="native_status_invalid")
+                return True
+            if not self.request["inspect_only"] and not self.request.get("reload_acknowledged"):
+                self.request["stage"] = "reload_pending"
+                if not self.mark("queued"):
+                    self.finish("failed", classification="control_receipt_unavailable")
+                return True
+            self.pages += 1
+            try:
+                for server in result["data"]:
+                    if server.get("name") != self.request["server_name"] or server.get("toolsError"):
+                        self.finish("failed", classification="catalogue_unavailable")
+                        return True
+                    tools = server.get("tools", {})
+                    if not isinstance(tools, dict):
+                        raise ValueError("invalid tools map")
+                    summaries = []
+                    for name, tool in tools.items():
+                        schema = tool.get("inputSchema", {})
+                        summaries.append(dict(name=name, arguments=sorted(schema.get("properties", {})),
+                            required=sorted(schema.get("required", [])),
+                            schema_sha256=hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest()))
+                    self.servers.append(dict(name=server["name"], tools=summaries))
+                    if len(json.dumps(self.servers)) > 262144:
+                        raise ValueError("bounded catalogue exceeded")
+                cursor = result.get("nextCursor")
+                if cursor is not None:
+                    if not isinstance(cursor, str) or cursor in self.cursors or self.pages >= 8:
+                        raise ValueError("bounded pagination exceeded")
+                    self.cursors.add(cursor)
+                    self.list_tools(cursor)
+                    return True
+                available = {tool["name"]: set(tool["arguments"]) for server in self.servers for tool in server["tools"]}
+                if not self.servers:
+                    self.finish("failed", classification="catalogue_unavailable")
+                    return True
+                missing = {name: sorted(set(arguments) - available.get(name, set()))
+                           for name, arguments in self.request["expected_tools"].items()
+                           if name not in available or not set(arguments) <= available[name]}
+                status = "schema_mismatch" if missing else "verified" if self.request["expected_tools"] else "inspected"
+                self.finish(status, servers=self.servers, missing=missing,
+                            catalogue_scope="owning_thread_connection", mission_control_session="not_checked")
+            except (KeyError, TypeError, ValueError, AttributeError):
+                self.finish("failed", classification="native_status_invalid")
+            return True
+
+
 class ReconnectSession:
     """Observe protocol metadata and serialize an idle shutdown against input."""
     def __init__(self, settings, live, lifecycle):
@@ -1087,15 +1323,23 @@ class ReconnectSession:
         self.gate = threading.RLock()
         self.pending, self.approvals, self.active, self.completed = {}, set(), set(), set()
         self.inputs = 0
-        self.ready, self.draining = False, False
+        self.control_active = False
+        self.ready, self.protocol_ready, self.draining = False, False, False
+        self.initialize_ok = False
+        self.owner_auth = "unknown" if settings.get("auth_mode") == "native-owner" else "profile_auth"
+        self.diagnostic = None
         self.operation, self.terminal, self.reopen_threads = None, set(), []
         self.published, self.error = None, None
         self.publish()
 
     def publish(self):
-        summary = dict(ready=self.ready, pending_requests=len(self.pending), pending_approvals=len(self.approvals),
+        summary = dict(ready=self.usable(), initialized_notification=self.ready, native_initialized=self.initialize_ok,
+                       credential_owner_auth=self.owner_auth,
+                       protocol_diagnostic=self.diagnostic,
+                       pending_requests=len(self.pending), pending_approvals=len(self.approvals),
                        processing_inputs=self.inputs,
-                       active_turns=len(self.active | {thread for thread in self.pending.values() if thread}),
+                       mcp_operation_active=self.control_active,
+                       active_turns=len(self.active | {thread for _, thread in self.pending.values() if thread}),
                        threads=sorted(self.lifecycle.threads), draining=self.draining, error=self.error)
         if summary != self.published:
             with lock(self.live.with_suffix(".lock")):
@@ -1103,6 +1347,10 @@ class ReconnectSession:
                 item.update(reconnect_control=1, reconnect_state=summary)
                 save(self.live, item)
             self.published = summary
+
+    def usable(self):
+        return (self.initialize_ok and (self.ready or self.protocol_ready)
+                and self.owner_auth in {"profile_auth", "authenticated"})
 
     @contextlib.contextmanager
     def input(self):
@@ -1127,7 +1375,10 @@ class ReconnectSession:
         method = value.get("method")
         key = json.dumps(value.get("id"))
         if method and "id" in value:
-            self.pending[key] = (value.get("params") or {}).get("threadId") if method == "turn/start" else None
+            self.pending[key] = (
+                method,
+                (value.get("params") or {}).get("threadId") if method == "turn/start" else None,
+            )
         elif not method and "id" in value:
             self.approvals.discard(key)
         if method == "initialized":
@@ -1137,10 +1388,30 @@ class ReconnectSession:
     def native(self, value):
         method, params = value.get("method"), value.get("params") or {}
         key = json.dumps(value.get("id"))
+        request_method, thread = (None, None)
         if method and "id" in value:
             self.approvals.add(key)
         elif not method and "id" in value:
-            thread = self.pending.pop(key, None)
+            request_method, thread = self.pending.pop(key, (None, None))
+            if request_method == "initialize":
+                self.initialize_ok = "result" in value and "error" not in value
+                self.diagnostic = dict(release=self.settings["release"], native_version=self.settings.get("native_version", "unknown"),
+                    method="initialize", stage="native_initialization", timestamp=time.time(),
+                    classification="initialized" if self.initialize_ok else "initialize_failed")
+            elif request_method and "result" in value and "error" not in value:
+                self.protocol_ready = True
+            if self.settings.get("auth_mode") == "native-owner" and request_method in {"getAuthStatus", "account/read", "account/logout"}:
+                result = value.get("result") or {}
+                if "error" in value:
+                    self.owner_auth = "auth_check_failed"
+                elif request_method == "account/logout":
+                    self.owner_auth = "signed_out"
+                elif result.get("authMethod") == "chatgpt" or (result.get("account") or {}).get("type") == "chatgpt":
+                    self.owner_auth = "authenticated"
+                else:
+                    self.owner_auth = "sign_in_required"
+                self.diagnostic = dict(release=self.settings["release"], native_version=self.settings.get("native_version", "unknown"),
+                    method=request_method, stage="credential_owner", timestamp=time.time(), classification=self.owner_auth)
             turn = (value.get("result") or {}).get("turn") or {}
             if thread and "error" not in value and turn.get("id") not in self.completed and turn.get("status") not in {"completed", "failed", "interrupted"}:
                 self.active.add(thread)
@@ -1196,7 +1467,7 @@ class ReconnectSession:
                 self.mark(reason)
                 self.terminal.add(self.operation)
                 return False
-            if not self.ready or self.inputs or self.pending or self.approvals or self.active:
+            if not self.usable() or self.inputs or self.control_active or self.pending or self.approvals or self.active:
                 return False
             # Check again under the same lock order as the command. Cancelling
             # or activating another release cannot race the shutdown boundary.
@@ -1274,7 +1545,8 @@ def adapter(settings, arguments):
                     physical_cwd=str(Path.cwd().resolve()), fenced=not direct_native,
                     mode="native-stdio" if direct_native else "desktop-stdio" if command == "app-server" else "cli",
                     snapshot_policy=env["_AI_FENCE_DESKTOP_CHECKPOINT_POLICY"], endpoint=None, release=settings["release"],
-                    cli_version=settings.get("cli_version", "unknown"), cli_sha256=settings.get("cli_sha256")))
+                    cli_version=settings.get("cli_version", "unknown"), cli_sha256=settings.get("cli_sha256"),
+                    native_version=settings.get("native_version"), native_sha256=settings.get("native_sha256")))
     env["_AI_FENCE_DESKTOP_LAUNCH"] = str(live)
     interactive = command != "app-server"
     lifecycle = Lifecycle(settings, lease)
@@ -1308,6 +1580,9 @@ def adapter(settings, arguments):
     reconnection = ReconnectSession(settings, live, lifecycle) if not interactive and not direct_native else None
     output_lock = threading.Lock()
     def send(value):
+        if reconnection:
+            with reconnection.gate:
+                reconnection.native(value)
         with output_lock:
             sys.stdout.buffer.write(json.dumps(value, separators=(",", ":")).encode() + b"\n")
             sys.stdout.buffer.flush()
@@ -1316,6 +1591,7 @@ def adapter(settings, arguments):
         with native_lock:
             child.stdin.write(json.dumps(value, separators=(",", ":")).encode() + b"\n")
             child.stdin.flush()
+    mcp_session = McpRefreshSession(settings, reconnection, native_send) if reconnection else None
     auth_bridge = auth_runtime.Bridge(settings, native_send, send) if settings.get("auth_mode") == "native-owner" else None
     def input_loop():
         reader = selectors.DefaultSelector()
@@ -1332,6 +1608,9 @@ def adapter(settings, arguments):
                 while b"\n" in pending:
                     line, pending = pending.split(b"\n", 1)
                     value = json.loads(line)
+                    if isinstance(value.get("id"), str) and value["id"].startswith("af_mcp_refresh_"):
+                        send(dict(id=value["id"], error=dict(code=-32600, message="Reserved adapter request ID namespace")))
+                        continue
                     with reconnection.input() if reconnection else contextlib.nullcontext(True) as allowed:
                         if not allowed:
                             if "id" in value and "method" in value:
@@ -1340,6 +1619,9 @@ def adapter(settings, arguments):
                                     "data": {"origin": "ai_fence", "stage": "reconnect", "retryable": True, "native_forwarded": False}}})
                             continue
                         try:
+                            if reconnection:
+                                with reconnection.gate:
+                                    reconnection.client(value)
                             if auth_bridge:
                                 if value.get("method") == "initialize":
                                     auth_runtime.initialize(settings, value)
@@ -1357,8 +1639,6 @@ def adapter(settings, arguments):
                                 "data": {"origin":"ai_fence", "stage":"workspace_preflight", "retryable":False, "native_forwarded":False}}})
                             continue
                         with reconnection.gate if reconnection else contextlib.nullcontext():
-                            if reconnection:
-                                reconnection.client(value)
                             native_send(value)
                         if auth_bridge and value.get("method") == "initialized":
                             try:
@@ -1401,6 +1681,19 @@ def adapter(settings, arguments):
     buffer = b""
     try:
         while True:
+            if mcp_session:
+                try:
+                    mcp_session.poll()
+                except (OSError, ValueError, TypeError, RuntimeError, KeyError):
+                    # Control metadata/receipt failures must not disconnect a
+                    # healthy desktop or expose internal responses to it.
+                    if mcp_session.pending:
+                        identifier = mcp_session.pending[0]
+                        with reconnection.gate:
+                            reconnection.pending.pop(json.dumps(identifier), None)
+                            mcp_session.pending = None
+                    mcp_session.request = None
+                    reconnection.control_active = False
             if reconnection and reconnection.poll():
                 stop(signal.SIGTERM, None)
             if deadline and time.monotonic() > deadline:
@@ -1418,13 +1711,13 @@ def adapter(settings, arguments):
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
                 value = json.loads(line)
+                if mcp_session and mcp_session.native(value):
+                    continue
                 if auth_bridge and auth_bridge.runtime(value):
                     continue
                 try:
                     with reconnection.gate if reconnection else contextlib.nullcontext():
                         forward = lifecycle.response(value)
-                        if reconnection:
-                            reconnection.native(value)
                         if forward:
                             send(value)
                 except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
@@ -1486,6 +1779,7 @@ def doctor(settings, args):
                   credential_probe="not performed; transport/history availability does not prove provider authentication",
                   installed_cli_version=settings.get("cli_version", "unknown"), installed_cli_sha256=settings.get("cli_sha256"),
                   update_policy=settings.get("update_policy", "off"),
+                  native_updates=settings.get("native_updates", "manual"),
                   reconnect_policy=settings.get("reconnect_policy", "auto"),
                   automatic_reconnect_enabled=reconnect_enabled(settings),
                   running_older_release=any(item["alive"] and item.get("release") != settings["release"] for item in launches),
@@ -1563,6 +1857,26 @@ def doctor(settings, args):
             if thread.get("archived"):
                 report["resume_diagnosis"].append("thread is archived")
     report["native_protocol_check"] = "use the isolated initialize/config-read integration test; status never attaches to a live stdio stream"
+    report["connection_health"] = [dict(pid=item["pid"],
+        proxy_listening=bool(item.get("listener_owned") and item.get("endpoint_tcp_alive")),
+        native_initialized=item.get("reconnect_state", {}).get("native_initialized", "not_observed"),
+        credential_owner_auth=item.get("reconnect_state", {}).get("credential_owner_auth", "not_observed"),
+        desktop_protocol_ready=item.get("reconnect_state", {}).get("ready", "not_observed"),
+        mcp_catalogue="use mcp-refresh --inspect-only with this PID, server name and loaded thread ID",
+        mobile_connection="requires_user_observation") for item in launches if item.get("alive")]
+    report["metadata_and_route_checks_passed"] = report["healthy"]
+    managed = [item for item in launches if item.get("alive") and item.get("mode") == "desktop-stdio" and item.get("fenced")]
+    if managed:
+        report["desktop_connection_verified"] = all(item.get("reconnect_state", {}).get("ready") is True for item in managed)
+        report["healthy"] = report["healthy"] and report["desktop_connection_verified"]
+    for name in ["bootstrap-status.json", "mcp-refresh-status.json", "native-update-status.json"]:
+        path = root / name
+        if path.exists() and path.stat().st_size <= 524288:
+            try:
+                report[name.removesuffix(".json")] = json.loads(path.read_text())
+            except (OSError, ValueError):
+                pass
+    report["client_recovery"] = "After a repaired connection, a cached login-required screen may need one client Restart/retry; do not repeatedly restart services or assume a new sign-in is required."
     print(json.dumps(report, indent=2))
     return report["healthy"]
 
@@ -1693,6 +2007,8 @@ def control(arguments):
     setup.add_argument("--auth-home", "--seed-home", dest="auth_home", type=Path,
                        help="single native ChatGPT credential owner; defaults to native CODEX_HOME on a fresh setup, retained on upgrade; select --state-home's path for profile auth")
     setup.add_argument("--updates", choices=["auto", "manual", "off"], help="verified checks from terminal updates and future app-server launches (default auto)")
+    setup.add_argument("--native-updates", choices=["manual", "desktop"],
+                       help="follow the running Windows Store desktop runtime on fresh WSL connections, or retain explicit native selection (default manual)")
     setup.add_argument("--reconnect", choices=["auto", "off"], help="idle reconnects after verified updates (default auto); retained on upgrade")
     setup.add_argument("--update-base-url", help="trusted HTTPS AI Fence release server; defaults to ai.yaaf.de (production) or ai-dev.yaaf.de (DEV)")
     setup.add_argument("--update-interval-seconds", type=int, choices=range(60, 604801), help="successful update-check interval, default 86400; failures back off 300 seconds")
@@ -1716,6 +2032,14 @@ def control(arguments):
     workspace = commands.add_parser("workspace", help="shared named workspace commands", add_help=False)
     workspace.add_argument("arguments", nargs=argparse.REMAINDER)
     commands.add_parser("rollback", help="select previous installed release; does not restore history or workspaces")
+    mcp = commands.add_parser("mcp-refresh", help="reload and inspect MCP tools through an idle owning desktop connection")
+    mcp.add_argument("--pid", type=int, help="exact adapter PID from doctor")
+    mcp.add_argument("--thread-id", help="thread already loaded by that adapter")
+    mcp.add_argument("--server-name", help="configured MCP server name; status uses this thread's existing connection")
+    mcp.add_argument("--inspect-only", action="store_true", help="inspect the thread catalogue without reloading configuration")
+    mcp.add_argument("--status", action="store_true", help="read the latest operation receipt")
+    mcp.add_argument("--expect-tool", action="append", default=[], metavar="NAME:ARG,ARG",
+                     help="verify that a loaded tool exposes these argument names; repeat for multiple tools")
     commands.add_parser("windows-launcher", help="print the packaged session-only Windows launcher")
     commands.add_parser("register", help="register an existing official installation for terminal automatic updates")
     registered = commands.add_parser("update-registered", help=argparse.SUPPRESS)
@@ -1778,16 +2102,27 @@ def control(arguments):
         return 0 if healthy or not args.strict else 1
     elif args.command == "workspace":
         return workspace_control(settings, args)
+    elif args.command == "mcp-refresh":
+        expected = {}
+        for entry in args.expect_tool:
+            name, separator, fields = entry.partition(":")
+            expected[name] = fields.split(",") if fields else []
+        result = mcp_refresh(settings, pid=args.pid, thread_id=args.thread_id, server_name=args.server_name, inspect_only=args.inspect_only,
+                             status=args.status, expected=expected)
+        print(json.dumps(result))
+        return 1 if result["status"] in {"failed", "unsupported", "expired", "schema_mismatch"} else 0
     elif args.command == "update":
         if args.check_only and args.reconnect:
             parser.error("--check-only cannot be combined with --reconnect")
         if not args.check_only:
             wait_for_payloads(settings)
         result = updates.check(settings, force=True, check_only=args.check_only)
+        native_settings = load(Path(settings["install_root"]) / "settings.json")
+        result["native_runtime"] = updates.native_check(native_settings, Path(__file__), check_only=args.check_only)
         if not args.check_only:
             result["reconnect"] = reconnect_after_update(settings, result, args.reconnect)
         print(json.dumps(result))
-        return 1 if result["status"] == "failed" or result.get("reconnect", {}).get("status") == "manual_reconnect_required" else 0
+        return 1 if result["status"] == "failed" or result["native_runtime"]["status"] == "failed" or result.get("reconnect", {}).get("status") == "manual_reconnect_required" else 0
     elif args.command == "register":
         register_installation(settings)
         print(json.dumps(dict(status="registered", install_root=settings["install_root"])))
@@ -1802,15 +2137,22 @@ def control(arguments):
         uninstall(settings, args.apply)
     elif args.command == "rollback":
         root = Path(settings["install_root"])
-        with lock(root / ".install.lock"):
+        with lock(root / ".install.lock"), contextlib.ExitStack() as cleanup:
+            settings = load(root / "settings.json")
             previous = load(root / "previous-settings.json")
             if previous["state_home"] != settings["state_home"]:
                 fail("rollback cannot change state-home identity")
+            if any(previous.get(key) != settings.get(key) for key in ["native_codex", "native_version", "native_sha256"]):
+                cleanup.enter_context(lock(root / ".lifecycle.lock", blocking=False))
+                native = trusted(Path(previous["native_codex"]), True)
+                if digest(native) != previous.get("native_sha256"):
+                    fail("previous native runtime integrity check failed; rollback was not applied")
             for name, expected in previous["files"].items():
                 if not (root / name).is_file() or digest(root / name) != expected:
                     fail("previous release integrity check failed; rollback was not applied")
             save(root / "snapshot-roots.json", dict(format=FORMAT, roots=previous["roots"]))
             previous["update_policy"] = "manual"
+            previous["native_updates"] = "manual"
             save(root / "settings.json", previous)
             save(root / "previous-settings.json", settings)
         print(json.dumps({"release": previous["release"], "restart_required": "only the affected connection, when ready"}))
@@ -1842,9 +2184,24 @@ def main():
                 os.environ["_AI_FENCE_DESKTOP_SETTINGS"] = json.dumps(selected)
                 script = cli_payload(selected).with_name("runtime.py")
                 os.execv(sys.executable, [sys.executable, str(script), mode, *arguments])
+            native_result = updates.native_check(settings, Path(__file__))
+            if native_result["status"] == "installed":
+                selected = load(Path(settings["install_root"]) / "settings.json")
+                os.environ["_AI_FENCE_DESKTOP_SETTINGS"] = json.dumps(selected)
+                os.execv(sys.executable, [sys.executable, str(cli_payload(selected).with_name("runtime.py")), mode, *arguments])
+            if native_result["status"] in {"failed", "waiting_for_connections"}:
+                print("ai-fence codex: desktop runtime update " + native_result["status"] +
+                      "; retaining the selected runtime; inspect codex-desktop doctor", file=sys.stderr)
         with lock(Path(settings["install_root"]) / ".lifecycle.lock", shared=True):
             if not (Path(settings["install_root"]) / "settings.json").exists():
                 fail("integration was uninstalled before this launch; use native Codex or rerun setup")
+            # A concurrent updater may have completed while this launch waited.
+            # Read the selection only after holding the lifecycle lock, so two
+            # native versions never enter the same history during an upgrade.
+            selected = load(Path(settings["install_root"]) / "settings.json")
+            if selected != settings:
+                os.environ["_AI_FENCE_DESKTOP_SETTINGS"] = json.dumps(selected)
+                os.execv(sys.executable, [sys.executable, str(cli_payload(selected).with_name("runtime.py")), mode, *arguments])
             return adapter(settings, arguments)
     if mode == "runtime":
         runtime(settings, arguments)

@@ -30,6 +30,10 @@ signed rather than Developer ID signed and notarized. See the
 [quickstart](https://ai.yaaf.de/docs) for provider auth, standalone data flow,
 logging, and manual install details.
 
+For a persistent native Windows Codex proxy, use the
+[Windows proxy installer](WINDOWS_PROXY.md). New installations and repairs use
+the same scheduled task with automatic failure recovery.
+
 For model access that works while `codex-apps` or `/usage` requests login, see
 [Codex native authentication limitations and safe next steps](CODEX_AUTH.md).
 
